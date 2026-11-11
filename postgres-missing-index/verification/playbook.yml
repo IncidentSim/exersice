@@ -1,0 +1,78 @@
+---
+- name: Verify postgres-missing-index from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    app_database: incidentsim
+    customer_count: 100000
+    report_count: 5
+    # Calibrated on a 1 vCPU / 1 GiB VM: about 0.005 s with the index and
+    # about 0.5 s without it.
+    max_report_seconds: 0.1
+
+  tasks:
+    # New customers on every run, so cached answers do not help.
+    - name: Choose customers for this run
+      ansible.builtin.set_fact:
+        customers: "{{ (range(1, customer_count + 1) | list | shuffle)[:report_count] }}"
+
+    # ansible.builtin.uri reports elapsed time in whole seconds only.
+    - name: Request customer reports and measure their latency
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --show-error
+          - --max-time
+          - "10"
+          - --write-out
+          - "\n%{http_code} %{time_total}"
+          - "{{ app_url }}/customers/{{ item }}/sales"
+      loop: "{{ customers }}"
+      register: reports
+      changed_when: false
+      failed_when: false
+
+    - name: Count the same sales directly in PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - "SELECT count(*) FROM sales WHERE customer_id = {{ item | int }}"
+        chdir: /
+      loop: "{{ customers }}"
+      register: expected_counts
+      changed_when: false
+
+    - name: Require each report to be correct and fast
+      ansible.builtin.assert:
+        that:
+          - item.0.rc == 0
+          - item.0.stdout_lines[-1].split()[0] == "200"
+          - (item.0.stdout_lines[:-1] | join('\n') | from_json).orders | int == item.1.stdout | trim | int
+          - item.0.stdout_lines[-1].split()[1] | float <= max_report_seconds
+        success_msg: >-
+          Customer {{ item.0.item }}: {{ item.1.stdout | trim }} sales in
+          {{ item.0.stdout_lines[-1].split()[1] }} s.
+        fail_msg: >-
+          Customer {{ item.0.item }}: expected HTTP 200 with {{ item.1.stdout | trim }}
+          sales within {{ max_report_seconds }} s, got
+          {{ item.0.stdout_lines[-1] | default('no response') }}
+          {{ item.0.stderr | default('') }}
+          {{ (item.0.stdout_lines[:-1] | join(' '))[:200] }}
+      loop: "{{ reports.results | zip(expected_counts.results) | list }}"
+      loop_control:
+        label: "{{ item.0.item }}"

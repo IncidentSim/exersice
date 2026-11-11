@@ -1,0 +1,114 @@
+---
+- name: Introduce the dropped customer index incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    app_database: incidentsim
+    sales_index: sales_customer_id_idx
+    slow_report_seconds: 0.1
+
+  tasks:
+    - name: Check the sales-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: 200
+      register: app_health
+      failed_when: false
+
+    - name: Check that the sales table exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - SELECT to_regclass('public.sales') IS NOT NULL
+        chdir: /
+      register: sales_table
+      changed_when: false
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - app_health.status == 200
+          - sales_table.rc == 0
+          - sales_table.stdout | trim == "t"
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    - name: Check whether the customer index exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - "SELECT to_regclass('public.{{ sales_index }}') IS NOT NULL"
+        chdir: /
+      register: index_exists
+      changed_when: false
+
+    # Migration 2026_11_10_cleanup_unused_indexes: the index looked unused on
+    # a staging copy without report traffic.
+    - name: Apply the index cleanup migration
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - "DROP INDEX {{ sales_index }}"
+          - --command
+          - ANALYZE sales
+        chdir: /
+      when: index_exists.stdout | trim == "t"
+      changed_when: true
+
+    - name: Time a customer report
+      ansible.builtin.command:
+        argv:
+          - curl
+          - --silent
+          - --output
+          - /dev/null
+          - --write-out
+          - "%{http_code} %{time_total}"
+          - "{{ app_url }}/customers/4242/sales"
+      register: incident_report
+      changed_when: false
+
+    - name: Require customer reports to be slow
+      ansible.builtin.assert:
+        that:
+          - incident_report.stdout.split()[0] == "200"
+          - incident_report.stdout.split()[1] | float > slow_report_seconds
+        fail_msg: >-
+          Expected a slow but successful report, got HTTP status and seconds:
+          {{ incident_report.stdout }}
+        success_msg: "A customer report now takes {{ incident_report.stdout.split()[1] }} s."
