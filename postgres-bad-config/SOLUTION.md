@@ -60,7 +60,7 @@ on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory
 4. Конфигурацию можно проверить, не запуская сервер:
 
    ```bash
-   sudo -u postgres /usr/lib/postgresql/16/bin/postgres \
+   runuser -u postgres -- /usr/lib/postgresql/16/bin/postgres \
      --config-file=/etc/postgresql/16/main/postgresql.conf -C shared_buffers
    ```
 
@@ -86,10 +86,10 @@ on socket "/var/run/postgresql/.s.PGSQL.5432" failed: No such file or directory
 ```bash
 sed -i 's/^shared_bufers = 8GB$/shared_buffers = 256MB/' \
   /etc/postgresql/16/main/conf.d/60-tuning.conf
-sudo -u postgres /usr/lib/postgresql/16/bin/postgres \
+runuser -u postgres -- /usr/lib/postgresql/16/bin/postgres \
   --config-file=/etc/postgresql/16/main/postgresql.conf -C shared_buffers
 systemctl restart postgresql@16-main
-sudo -u postgres psql -c 'SHOW shared_buffers' -c 'SHOW work_mem' -c 'SHOW effective_cache_size'
+runuser -u postgres -- psql -c 'SHOW shared_buffers' -c 'SHOW work_mem' -c 'SHOW effective_cache_size'
 ```
 
 Также допустимо закомментировать строку: тогда действует значение по умолчанию из `postgresql.conf` (`128MB`), а остальные параметры релиза сохраняются.
