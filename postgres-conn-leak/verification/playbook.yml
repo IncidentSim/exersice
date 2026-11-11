@@ -1,0 +1,102 @@
+---
+- name: Verify postgres-conn-leak from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    # Observation window: 13 samples, 10 seconds apart (120 seconds).
+    sample_count: 13
+    sample_interval: 10
+    # Raising the limit far enough to hide a leak is not a fix.
+    max_connections_ceiling: 200
+    # Allowed change in the number of client sessions during the second
+    # half of the window, once short-lived sessions have settled.
+    max_session_drift: 3
+
+  tasks:
+    - name: Read max_connections from PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - SHOW max_connections
+        chdir: /
+      register: max_connections_query
+      changed_when: false
+      failed_when: false
+
+    - name: Require PostgreSQL to accept connections
+      ansible.builtin.assert:
+        that:
+          - max_connections_query.rc == 0
+        fail_msg: >-
+          PostgreSQL does not accept local connections:
+          {{ max_connections_query.stderr | default('') | trim }}
+
+    - name: Require a bounded connection limit
+      ansible.builtin.assert:
+        that:
+          - max_connections_query.stdout | trim | int <= max_connections_ceiling
+        success_msg: "max_connections = {{ max_connections_query.stdout | trim }}"
+        fail_msg: >-
+          Expected max_connections <= {{ max_connections_ceiling }}, found
+          {{ max_connections_query.stdout | trim }}. A larger limit only delays exhaustion.
+
+    - name: Save a test order through the application
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: verification
+          note: connection leak check
+        status_code: [201]
+        return_content: true
+        timeout: 10
+      register: probe_write
+      failed_when: false
+
+    - name: Require the order to be accepted
+      ansible.builtin.assert:
+        that:
+          - probe_write.status == 201
+        fail_msg: >-
+          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
+          {{ probe_write.content | default(probe_write.msg) | default('') }}
+
+    - name: Start the observation window
+      ansible.builtin.set_fact:
+        probe_order_id: "{{ probe_write.json.id }}"
+        session_samples: []
+
+    - name: Observe application requests and client sessions
+      ansible.builtin.include_tasks: observe.yml
+      loop: "{{ range(sample_count) | list }}"
+      loop_control:
+        loop_var: sample_index
+
+    - name: Summarize the second half of the window
+      ansible.builtin.set_fact:
+        settled_samples: "{{ session_samples[(sample_count // 2):] }}"
+
+    - name: Require a stable number of client sessions
+      ansible.builtin.assert:
+        that:
+          - (settled_samples | max) - (settled_samples | min) <= max_session_drift
+        success_msg: >-
+          Client sessions stayed between {{ settled_samples | min }} and
+          {{ settled_samples | max }} during the second half of the window.
+        fail_msg: >-
+          Expected the number of client sessions to change by at most
+          {{ max_session_drift }} during the second half of the window.
+          Observed sessions: {{ session_samples | join(', ') }}.

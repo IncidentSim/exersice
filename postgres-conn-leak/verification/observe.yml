@@ -1,0 +1,59 @@
+---
+- name: Wait for the next sample
+  ansible.builtin.pause:
+    seconds: "{{ sample_interval }}"
+  when: sample_index | int > 0
+
+- name: Check the orders-api health endpoint
+  ansible.builtin.uri:
+    url: "{{ app_url }}/healthz"
+    return_content: true
+    status_code: [200]
+    timeout: 10
+  register: probe_health
+  failed_when: false
+
+- name: Read the test order
+  ansible.builtin.uri:
+    url: "{{ app_url }}/orders/{{ probe_order_id }}"
+    return_content: true
+    status_code: [200]
+    timeout: 10
+  register: probe_read
+  failed_when: false
+
+- name: Require the application to serve requests
+  ansible.builtin.assert:
+    that:
+      - probe_health.status == 200
+      - probe_read.status == 200
+      - probe_read.json.item == "verification"
+    success_msg: "Sample {{ sample_index }}: application requests succeeded."
+    fail_msg: >-
+      Sample {{ sample_index }}: expected HTTP 200 from /healthz and
+      /orders/{{ probe_order_id }}, got {{ probe_health.status }} and
+      {{ probe_read.status }}:
+      {{ probe_health.content | default(probe_health.msg) | default('') }}
+
+- name: Count client sessions in PostgreSQL
+  ansible.builtin.command:
+    argv:
+      - runuser
+      - -u
+      - postgres
+      - --
+      - psql
+      - --no-psqlrc
+      - --tuples-only
+      - --no-align
+      - --command
+      - >-
+        SELECT count(*) FROM pg_stat_activity
+        WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
+    chdir: /
+  register: session_count
+  changed_when: false
+
+- name: Record the sample
+  ansible.builtin.set_fact:
+    session_samples: "{{ session_samples + [session_count.stdout | trim | int] }}"

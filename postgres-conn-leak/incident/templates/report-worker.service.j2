@@ -1,0 +1,17 @@
+[Unit]
+Description=IncidentSim sales report worker
+After=network.target {{ pg_unit }}
+Wants={{ pg_unit }}
+
+[Service]
+Type=simple
+User={{ worker_user }}
+Group={{ worker_user }}
+Environment="DATABASE_DSN=host=/var/run/postgresql dbname={{ app_database }} user={{ worker_user }}"
+Environment=REPORT_INTERVAL_SECONDS={{ worker_interval }}
+ExecStart=/usr/bin/python3 {{ worker_root }}/worker.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

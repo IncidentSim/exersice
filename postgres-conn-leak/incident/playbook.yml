@@ -1,0 +1,152 @@
+---
+- name: Introduce the leaking report-worker incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    exercise_root: /opt/incidentctl/postgres-conn-leak
+    worker_root: "{{ exercise_root }}/report-worker"
+    worker_user: report_worker
+    worker_unit: incidentsim-report-worker.service
+    worker_interval: 4
+    app_url: http://127.0.0.1:8080
+    app_database: incidentsim
+    pg_unit: postgresql@16-main.service
+
+  tasks:
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: 200
+      register: app_health
+      failed_when: false
+
+    - name: Check that the application database exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - SELECT to_regclass('public.orders') IS NOT NULL
+        chdir: /
+      register: orders_table
+      changed_when: false
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - app_health.status == 200
+          - orders_table.rc == 0
+          - orders_table.stdout | trim == "t"
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    - name: Create the report-worker system user
+      ansible.builtin.user:
+        name: "{{ worker_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+
+    - name: Create the report-worker directory
+      ansible.builtin.file:
+        path: "{{ worker_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy the report-worker source and role
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../apps/report-worker/{{ item }}"
+        dest: "{{ worker_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - worker.py
+        - role.sql
+      notify: Restart report-worker
+
+    - name: Create the report-worker database role
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --file
+          - "{{ worker_root }}/role.sql"
+        chdir: /
+      register: worker_role
+      changed_when: false
+
+    - name: Install the report-worker systemd unit
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/report-worker.service.j2"
+        dest: "/etc/systemd/system/{{ worker_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart report-worker
+
+    - name: Enable and start the report-worker
+      ansible.builtin.systemd_service:
+        name: "{{ worker_unit }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply report-worker changes
+      ansible.builtin.meta: flush_handlers
+
+    # The worker keeps one more idle session every few seconds. Wait until it
+    # has taken every non-reserved connection slot.
+    - name: Wait until the application can no longer connect
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+        return_content: true
+      register: incident_health
+      retries: 45
+      delay: 5
+      until: incident_health.status == 503
+
+    - name: Require the application to report exhausted connections
+      ansible.builtin.assert:
+        that:
+          - incident_health.status == 503
+          - >-
+            'too many clients' in incident_health.json.detail | default('')
+            or 'connection slots are reserved' in incident_health.json.detail | default('')
+        fail_msg: >-
+          Expected HTTP 503 with a connection-limit error, got HTTP
+          {{ incident_health.status }}: {{ incident_health.content | default('') }}
+        success_msg: >-
+          The application cannot connect:
+          {{ incident_health.json.detail | default('') }}
+
+  handlers:
+    - name: Restart report-worker
+      ansible.builtin.systemd_service:
+        name: "{{ worker_unit }}"
+        daemon_reload: true
+        state: restarted

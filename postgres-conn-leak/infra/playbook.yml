@@ -1,0 +1,418 @@
+---
+- name: Deploy the healthy postgres-conn-leak infrastructure
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+
+  vars:
+    exercise_root: /opt/incidentctl/postgres-conn-leak
+    app_root: "{{ exercise_root }}/orders-api"
+    app_user: orders_api
+    app_port: 8080
+    app_url: "http://127.0.0.1:{{ app_port }}"
+    app_database: incidentsim
+    postgresql_package_version: 16.15-0ubuntu0.24.04.1
+    psycopg2_package_version: 2.9.9-1build1
+    pg_unit: postgresql@16-main.service
+    pg_conf_dir: /etc/postgresql/16/main
+    pg_bin_dir: /usr/lib/postgresql/16/bin
+    pg_data_dir: /var/lib/postgresql/16/main
+    worker_user: report_worker
+    worker_unit: incidentsim-report-worker.service
+
+  tasks:
+    - name: Require Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version is version("24.04", ">=")
+          - ansible_facts.distribution_version is version("24.10", "<")
+        fail_msg: This exercise requires Ubuntu 24.04.
+
+    # --- PostgreSQL ------------------------------------------------------
+
+    - name: Install PostgreSQL and the application driver at recorded versions
+      ansible.builtin.apt:
+        name:
+          - "postgresql-16={{ postgresql_package_version }}"
+          - "postgresql-client-16={{ postgresql_package_version }}"
+          - "python3-psycopg2={{ psycopg2_package_version }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        policy_rc_d: 101
+
+    - name: Check the cluster data directory
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}/PG_VERSION"
+      register: pg_data_version
+
+    - name: Create the main cluster
+      ansible.builtin.command:
+        argv: [pg_createcluster, --port, "5432", "16", main]
+      when: not pg_data_version.stat.exists
+      changed_when: true
+
+    # Restoring the baseline after the incident: the report-worker is not
+    # part of the healthy state.
+    - name: Check for the report-worker unit
+      ansible.builtin.stat:
+        path: "/etc/systemd/system/{{ worker_unit }}"
+      register: worker_unit_file
+
+    - name: Stop and disable the report-worker
+      ansible.builtin.systemd_service:
+        name: "{{ worker_unit }}"
+        state: stopped
+        enabled: false
+      when: worker_unit_file.stat.exists
+
+    - name: Remove the report-worker unit
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ worker_unit }}"
+        state: absent
+      register: worker_unit_removed
+
+    - name: Reload systemd after removing the report-worker
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: worker_unit_removed.changed
+
+    - name: Remove the report-worker files
+      ansible.builtin.file:
+        path: "{{ exercise_root }}/report-worker"
+        state: absent
+
+    - name: Remove the report-worker system user
+      ansible.builtin.user:
+        name: "{{ worker_user }}"
+        state: absent
+
+    - name: Install the healthy PostgreSQL settings
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/postgresql.conf.j2"
+        dest: "{{ pg_conf_dir }}/conf.d/50-incidentsim.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    - name: Install the PostgreSQL monitoring settings
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/monitoring/postgresql-monitoring.conf.j2"
+        dest: "{{ pg_conf_dir }}/conf.d/90-incidentsim-monitoring.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    - name: Clear settings made with ALTER SYSTEM
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/postgresql.auto.conf.j2"
+        dest: "{{ pg_data_dir }}/postgresql.auto.conf"
+        owner: postgres
+        group: postgres
+        mode: "0600"
+      notify: Restart PostgreSQL
+
+    - name: Enable and start PostgreSQL
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply PostgreSQL changes before creating the schema
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for PostgreSQL to accept connections
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, pg_isready, --quiet]
+      register: pg_ready
+      changed_when: false
+      failed_when: false
+      retries: 15
+      delay: 2
+      until: pg_ready.rc == 0
+
+    - name: Require PostgreSQL to be ready
+      ansible.builtin.assert:
+        that:
+          - pg_ready.rc == 0
+        fail_msg: "PostgreSQL did not accept connections (pg_isready rc={{ pg_ready.rc }})."
+
+    - name: Check for the report-worker database role
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - "SELECT count(*) FROM pg_roles WHERE rolname = '{{ worker_user }}'"
+        chdir: /
+      register: worker_role
+      changed_when: false
+
+    - name: Drop the report-worker database role and its sessions
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE usename = '{{ worker_user }}'"
+          - --command
+          - "DROP OWNED BY {{ worker_user }}"
+          - --command
+          - "DROP ROLE {{ worker_user }}"
+        chdir: /
+      when: worker_role.stdout | trim != "0"
+      changed_when: true
+
+    - name: Check for per-role and per-database setting overrides
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - SELECT count(*) FROM pg_db_role_setting
+        chdir: /
+      register: setting_overrides
+      changed_when: false
+
+    - name: Create the exercise directory
+      ansible.builtin.file:
+        path: "{{ exercise_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy the setting override reset script
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/reset-overrides.sql"
+        dest: "{{ exercise_root }}/reset-overrides.sql"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Reset per-role and per-database setting overrides
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --file
+          - "{{ exercise_root }}/reset-overrides.sql"
+        chdir: /
+      when: setting_overrides.stdout | trim != "0"
+      changed_when: true
+
+    # --- Database and application ----------------------------------------
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy the orders-api source and schema
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../apps/orders-api/{{ item }}"
+        dest: "{{ app_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - app.py
+        - schema.sql
+      register: app_files
+      notify: Restart orders-api
+
+    - name: Check whether the application database exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - "SELECT count(*) FROM pg_database WHERE datname = '{{ app_database }}'"
+        chdir: /
+      register: app_database_exists
+      changed_when: false
+
+    - name: Create the application database
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, createdb, "{{ app_database }}"]
+        chdir: /
+      when: app_database_exists.stdout | trim == "0"
+      changed_when: true
+
+    - name: Check the application schema and grants
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - >-
+            SELECT to_regclass('public.orders') IS NOT NULL
+               AND EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ app_user }}')
+               AND has_table_privilege('{{ app_user }}', 'public.orders', 'INSERT')
+               AND has_table_privilege('{{ app_user }}', 'public.orders', 'SELECT')
+        chdir: /
+      register: app_schema_ready
+      changed_when: false
+
+    - name: Apply the application schema
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --file
+          - "{{ app_root }}/schema.sql"
+        chdir: /
+      when: app_schema_ready.stdout | trim != "t" or app_files.changed
+      changed_when: true
+
+    - name: Create the orders-api system user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+
+    - name: Install the orders-api systemd unit
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/orders-api.service.j2"
+        dest: /etc/systemd/system/incidentsim-orders-api.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart orders-api
+
+    - name: Enable the orders-api service
+      ansible.builtin.systemd_service:
+        name: incidentsim-orders-api.service
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    - name: Apply service changes before smoke tests
+      ansible.builtin.meta: flush_handlers
+
+    # --- Smoke tests -----------------------------------------------------
+
+    - name: Wait for the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        return_content: true
+        status_code: 200
+      register: app_health
+      retries: 15
+      delay: 2
+      until: app_health.status == 200
+
+    - name: Save a smoke-test order
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: infra-smoke
+          note: saved by the infra playbook
+        status_code: 201
+        return_content: true
+      register: smoke_write
+
+    - name: Read the smoke-test order back
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders/{{ smoke_write.json.id }}"
+        return_content: true
+        status_code: 200
+      register: smoke_read
+
+    - name: Require the order to be stored
+      ansible.builtin.assert:
+        that:
+          - smoke_read.json.item == "infra-smoke"
+        fail_msg: The healthy infrastructure did not store the smoke-test order.
+
+  handlers:
+    - name: Validate PostgreSQL configuration
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - "{{ pg_bin_dir }}/postgres"
+          - "--config-file={{ pg_conf_dir }}/postgresql.conf"
+          - -C
+          - max_connections
+        chdir: /
+      changed_when: false
+      listen: Restart PostgreSQL
+
+    - name: Restart PostgreSQL service
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        daemon_reload: true
+        state: restarted
+      listen: Restart PostgreSQL
+
+    - name: Restart orders-api
+      ansible.builtin.systemd_service:
+        name: incidentsim-orders-api.service
+        daemon_reload: true
+        state: restarted
