@@ -39,13 +39,13 @@ FATAL:  pg_hba.conf rejects connection for host "127.0.0.1", user "orders_api", 
 2. Сервер работает и пускает администратора через сокет:
 
    ```bash
-   sudo -u postgres psql -c 'SELECT 1'
+   runuser -u postgres -- psql -c 'SELECT 1'
    ```
 
 3. Правила в том порядке, в каком их применяет сервер:
 
    ```bash
-   sudo -u postgres psql -c \
+   runuser -u postgres -- psql -c \
      "SELECT rule_number, line_number, type, database, user_name, address, auth_method
       FROM pg_hba_file_rules ORDER BY rule_number"
    ```
@@ -70,7 +70,7 @@ FATAL:  pg_hba.conf rejects connection for host "127.0.0.1", user "orders_api", 
 Удалите блок между строками `# BEGIN maintenance window OPS-1432` и `# END maintenance window OPS-1432`, затем проверьте и примените правила:
 
 ```bash
-sudo -u postgres psql -c 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL'
+runuser -u postgres -- psql -c 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL'
 systemctl reload postgresql@16-main
 ```
 

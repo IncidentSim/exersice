@@ -11,7 +11,7 @@ curl --silent http://127.0.0.1:8080/healthz
 При этом PostgreSQL запущен, и администратор без проблем заходит в базу:
 
 ```bash
-sudo -u postgres psql incidentsim
+runuser -u postgres -- psql incidentsim
 ```
 
 ## Топология
