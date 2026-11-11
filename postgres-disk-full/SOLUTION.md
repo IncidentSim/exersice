@@ -40,7 +40,7 @@ Sample 0: expected HTTP 201 from POST /orders, got 500:
 3. Нужно смотреть файловую систему каталога данных:
 
    ```bash
-   sudo -u postgres psql -Atc 'SHOW data_directory'
+   runuser -u postgres -- psql -Atc 'SHOW data_directory'
    df -h /var/lib/postgresql/16/main
    findmnt --target /var/lib/postgresql/16/main
    ```
