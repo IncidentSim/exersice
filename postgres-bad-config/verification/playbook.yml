@@ -1,0 +1,124 @@
+---
+- name: Verify postgres-bad-config from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    # Settings delivered by the tuning release that must stay in effect.
+    expected_settings:
+      work_mem: 16MB
+      effective_cache_size: 512MB
+
+  tasks:
+    - name: Read the effective PostgreSQL settings
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --field-separator=|
+          - --command
+          - >-
+            SELECT current_setting('work_mem'),
+                   current_setting('effective_cache_size'),
+                   pg_size_bytes(current_setting('shared_buffers')),
+                   current_setting('shared_buffers')
+        chdir: /
+      register: settings_query
+      changed_when: false
+      failed_when: false
+
+    - name: Require PostgreSQL to accept connections
+      ansible.builtin.assert:
+        that:
+          - settings_query.rc == 0
+        fail_msg: >-
+          PostgreSQL does not accept local connections:
+          {{ settings_query.stderr | default('') | trim }}
+
+    - name: Read the VM memory size
+      ansible.builtin.slurp:
+        src: /proc/meminfo
+      register: meminfo
+
+    - name: Parse the observed values
+      ansible.builtin.set_fact:
+        observed_settings:
+          work_mem: "{{ (settings_query.stdout | trim).split('|')[0] }}"
+          effective_cache_size: "{{ (settings_query.stdout | trim).split('|')[1] }}"
+        shared_buffers_bytes: "{{ (settings_query.stdout | trim).split('|')[2] | int }}"
+        shared_buffers_text: "{{ (settings_query.stdout | trim).split('|')[3] }}"
+        memory_bytes: >-
+          {{ (meminfo.content | b64decode | regex_search('MemTotal:\s+(\d+) kB', '\1') | first | int) * 1024 }}
+
+    - name: Require the tuning settings to stay in effect
+      ansible.builtin.assert:
+        that:
+          - observed_settings[item.key] == item.value
+        success_msg: "{{ item.key }} = {{ item.value }}"
+        fail_msg: >-
+          Expected {{ item.key }} = {{ item.value }} from the tuning release,
+          found {{ observed_settings[item.key] }}.
+      loop: "{{ expected_settings | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Require shared_buffers to fit the VM
+      ansible.builtin.assert:
+        that:
+          - shared_buffers_bytes | int <= (memory_bytes | int) // 2
+        success_msg: >-
+          shared_buffers = {{ shared_buffers_text }} fits half of
+          {{ (memory_bytes | int) // 1048576 }} MiB of memory.
+        fail_msg: >-
+          Expected shared_buffers <= {{ (memory_bytes | int) // 2097152 }} MiB
+          (half of the VM memory), found {{ shared_buffers_text }}.
+
+    - name: Save a test order through the application
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: verification
+          note: configuration check
+        status_code: [201]
+        return_content: true
+        timeout: 10
+      register: probe_write
+      failed_when: false
+
+    - name: Require the order to be accepted
+      ansible.builtin.assert:
+        that:
+          - probe_write.status == 201
+        fail_msg: >-
+          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
+          {{ probe_write.content | default(probe_write.msg) | default('') }}
+
+    - name: Read the test order back
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders/{{ probe_write.json.id }}"
+        return_content: true
+        status_code: [200]
+        timeout: 10
+      register: probe_read
+      failed_when: false
+
+    - name: Require the stored order to match
+      ansible.builtin.assert:
+        that:
+          - probe_read.status == 200
+          - probe_read.json.item == "verification"
+        success_msg: The application stores and reads orders.
+        fail_msg: >-
+          Expected order {{ probe_write.json.id }} to be read back, got HTTP
+          {{ probe_read.status }}.

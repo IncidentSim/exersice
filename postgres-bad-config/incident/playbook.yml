@@ -1,0 +1,84 @@
+---
+- name: Introduce the broken tuning release incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    pg_unit: postgresql@16-main.service
+    pg_conf_dir: /etc/postgresql/16/main
+    pg_log: /var/log/postgresql/postgresql-16-main.log
+
+  tasks:
+    - name: Check the current tuning file
+      ansible.builtin.stat:
+        path: "{{ pg_conf_dir }}/conf.d/60-tuning.conf"
+      register: tuning_file
+
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+      register: app_health
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - tuning_file.stat.isreg | default(false)
+          - app_health.status in [200, 503]
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    # The release keeps the useful settings, but the shared_buffers line has
+    # a typo and a value sized for a much larger server. The configuration is
+    # deliberately not validated: a failed start is the intended fault.
+    - name: Roll out the 2026.11 tuning release
+      ansible.builtin.copy:
+        dest: "{{ pg_conf_dir }}/conf.d/60-tuning.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          # Performance tuning for the orders database, release 2026.11.
+          # Sized for the new database servers.
+          shared_bufers = 8GB
+          work_mem = 16MB
+          effective_cache_size = 512MB
+          maintenance_work_mem = 64MB
+      register: tuning_release
+
+    - name: Restart PostgreSQL with the new release
+      ansible.builtin.command:
+        argv: [systemctl, restart, "{{ pg_unit }}"]
+      register: pg_restart
+      changed_when: true
+      failed_when: false
+      when: tuning_release.changed
+
+    - name: Check whether PostgreSQL accepts connections
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, pg_isready, --quiet]
+      register: pg_ready
+      changed_when: false
+      failed_when: false
+
+    - name: Require PostgreSQL to be down
+      ansible.builtin.assert:
+        that:
+          - pg_ready.rc != 0
+        fail_msg: PostgreSQL still accepts connections after the tuning release.
+
+    - name: Read the PostgreSQL log
+      ansible.builtin.command:
+        argv: [tail, -n, "50", "{{ pg_log }}"]
+      register: pg_log_tail
+      changed_when: false
+
+    - name: Require the startup failure to name the unknown parameter
+      ansible.builtin.assert:
+        that:
+          - "'shared_bufers' in pg_log_tail.stdout"
+        fail_msg: The PostgreSQL log does not mention the misspelled parameter.
+        success_msg: PostgreSQL refused to start because of the tuning release.

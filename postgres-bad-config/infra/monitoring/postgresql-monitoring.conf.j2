@@ -1,0 +1,7 @@
+# Managed by the IncidentSim infra playbook.
+# Server-side logging used to investigate incidents. The log is written to
+# /var/log/postgresql on the root filesystem.
+log_checkpoints = on
+log_min_error_statement = error
+log_autovacuum_min_duration = 10s
+log_temp_files = 0
