@@ -1,0 +1,115 @@
+---
+- name: Verify postgres-hba-reject from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    app_user: orders_api
+    app_database: incidentsim
+    # Part of the exercise contract: the application credential on the VM.
+    app_password_file: /etc/incidentsim/orders-api.password
+    wrong_password: incidentsim-verification-wrong-password
+
+  tasks:
+    - name: Read the application password
+      ansible.builtin.slurp:
+        src: "{{ app_password_file }}"
+      register: app_password_content
+      no_log: true
+
+    - name: Log in as the application role over TCP with its password
+      ansible.builtin.command:
+        argv: &tcp_login
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --host=127.0.0.1
+          - --port=5432
+          - "--username={{ app_user }}"
+          - "--dbname={{ app_database }}"
+          - --command
+          - SELECT current_user
+        chdir: /
+      environment:
+        PGPASSWORD: "{{ app_password_content.content | b64decode | trim }}"
+        PGCONNECT_TIMEOUT: "5"
+      register: correct_login
+      changed_when: false
+      failed_when: false
+
+    - name: Require the correct password to be accepted
+      ansible.builtin.assert:
+        that:
+          - correct_login.rc == 0
+          - correct_login.stdout | trim == app_user
+        success_msg: "{{ app_user }} logs in over TCP with its password."
+        fail_msg: >-
+          Expected {{ app_user }} to log in to {{ app_database }} at 127.0.0.1:5432,
+          got rc={{ correct_login.rc }}: {{ correct_login.stderr | trim }}
+
+    - name: Log in as the application role over TCP with a wrong password
+      ansible.builtin.command:
+        argv: *tcp_login
+        chdir: /
+      environment:
+        PGPASSWORD: "{{ wrong_password }}"
+        PGCONNECT_TIMEOUT: "5"
+      register: wrong_login
+      changed_when: false
+      failed_when: false
+
+    - name: Require a wrong password to be refused by password authentication
+      ansible.builtin.assert:
+        that:
+          - wrong_login.rc != 0
+          - "'password authentication failed' in wrong_login.stderr"
+        success_msg: A wrong password is refused by password authentication.
+        fail_msg: >-
+          Expected a wrong password to fail with "password authentication failed",
+          got rc={{ wrong_login.rc }}:
+          {{ (wrong_login.stderr | trim) or (wrong_login.stdout | trim) }}
+
+    - name: Save a test order through the application
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: verification
+          note: authentication check
+        status_code: [201]
+        return_content: true
+        timeout: 10
+      register: probe_write
+      failed_when: false
+
+    - name: Require the order to be accepted
+      ansible.builtin.assert:
+        that:
+          - probe_write.status == 201
+        fail_msg: >-
+          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
+          {{ probe_write.content | default(probe_write.msg) | default('') }}
+
+    - name: Read the test order back
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders/{{ probe_write.json.id }}"
+        return_content: true
+        status_code: [200]
+        timeout: 10
+      register: probe_read
+      failed_when: false
+
+    - name: Require the stored order to match
+      ansible.builtin.assert:
+        that:
+          - probe_read.status == 200
+          - probe_read.json.item == "verification"
+        success_msg: The application stores and reads orders.
+        fail_msg: >-
+          Expected order {{ probe_write.json.id }} to be read back, got HTTP
+          {{ probe_read.status }}.

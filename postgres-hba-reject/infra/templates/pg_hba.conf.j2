@@ -1,0 +1,18 @@
+# Managed by the IncidentSim infra playbook.
+#
+# TYPE  DATABASE          USER          ADDRESS          METHOD
+
+# Administrative access over the Unix socket.
+local   all               postgres                       peer
+local   all               all                            peer
+
+# orders-api connects over TCP with a password.
+host    {{ app_database }}       {{ app_user }}    127.0.0.1/32     scram-sha-256
+
+# Other local TCP clients.
+host    all               all           127.0.0.1/32     scram-sha-256
+host    all               all           ::1/128          scram-sha-256
+
+local   replication       all                            peer
+host    replication       all           127.0.0.1/32     scram-sha-256
+host    replication       all           ::1/128          scram-sha-256

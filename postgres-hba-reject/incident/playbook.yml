@@ -1,0 +1,85 @@
+---
+- name: Introduce the pg_hba reject rule incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    pg_unit: postgresql@16-main.service
+    pg_hba_file: /etc/postgresql/16/main/pg_hba.conf
+
+  tasks:
+    - name: Check the client authentication file
+      ansible.builtin.stat:
+        path: "{{ pg_hba_file }}"
+      register: hba_file
+
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+      register: app_health
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - hba_file.stat.isreg | default(false)
+          - app_health.status in [200, 503]
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    - name: Put a reject rule for local TCP clients first
+      ansible.builtin.blockinfile:
+        path: "{{ pg_hba_file }}"
+        insertbefore: BOF
+        marker: "# {mark} maintenance window OPS-1432"
+        block: |
+          # Block TCP clients on the loopback interface while maintenance runs.
+          host    all               all           127.0.0.1/32     reject
+      register: reject_rule
+
+    - name: Validate the client authentication rules
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL
+        chdir: /
+      register: hba_errors
+      changed_when: false
+      failed_when: hba_errors.rc != 0 or hba_errors.stdout | trim != "0"
+
+    - name: Reload PostgreSQL
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        state: reloaded
+      when: reject_rule.changed
+
+    - name: Wait until the application can no longer log in
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+        return_content: true
+      register: incident_health
+      retries: 10
+      delay: 1
+      until: incident_health.status == 503
+
+    - name: Require the application login to be rejected by pg_hba.conf
+      ansible.builtin.assert:
+        that:
+          - incident_health.status == 503
+          - "'pg_hba.conf rejects connection' in incident_health.json.detail | default('')"
+        fail_msg: >-
+          Expected HTTP 503 caused by pg_hba.conf, got HTTP
+          {{ incident_health.status }}: {{ incident_health.content | default('') }}
+        success_msg: "{{ incident_health.json.detail | default('') }}"
