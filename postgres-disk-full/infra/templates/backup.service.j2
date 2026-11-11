@@ -1,0 +1,12 @@
+[Unit]
+Description=IncidentSim database backup
+After={{ pg_unit }}
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile={{ backup_env_file }}
+ExecStart={{ backup_script }}
+Nice=10

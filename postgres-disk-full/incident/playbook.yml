@@ -1,0 +1,125 @@
+---
+- name: Introduce the backups-fill-the-data-volume incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    app_database: incidentsim
+    pg_home: /var/lib/postgresql
+    backup_env_file: /etc/incidentsim/backup.env
+    backup_service: incidentsim-backup.service
+    backup_timer: incidentsim-backup.timer
+    # Upper bound for the fill loop; the volume is full after about ten dumps.
+    max_fill_runs: 60
+    # Large enough that a few inserts need a new heap page on the full volume.
+    probe_note: "{{ 'i' * 1500 }}"
+
+  tasks:
+    - name: Check the backup configuration and timer
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ backup_env_file }}"
+        - "/etc/systemd/system/{{ backup_timer }}"
+      register: incident_prerequisites
+
+    - name: Read the data volume mount
+      ansible.builtin.command:
+        argv: [findmnt, --noheadings, --output, FSTYPE, --mountpoint, "{{ pg_home }}"]
+      register: data_volume_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: 200
+      register: app_health
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - incident_prerequisites.results | map(attribute='stat.exists') | min
+          - data_volume_mount.rc == 0
+          - app_health.status == 200
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    - name: Store backups in the PostgreSQL home directory without rotation
+      ansible.builtin.copy:
+        dest: "{{ backup_env_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Managed by the IncidentSim infra playbook.
+          BACKUP_DATABASE={{ app_database }}
+          BACKUP_DIR={{ pg_home }}/backups
+          BACKUP_KEEP=0
+
+    - name: Keep the backup timer running
+      ansible.builtin.systemd_service:
+        name: "{{ backup_timer }}"
+        enabled: true
+        masked: false
+        state: started
+
+    # Each start of the oneshot unit blocks until one dump is written. The loop
+    # stops at the first failed dump, which is the one that hits ENOSPC and
+    # leaves a truncated file behind, so the volume ends up completely full.
+    - name: Accumulate backups until the data volume is full
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -u
+          runs=0
+          for _ in $(seq 1 {{ max_fill_runs }}); do
+            systemctl start {{ backup_service }} || break
+            runs=$((runs + 1))
+          done
+          echo "$runs"
+      register: fill_runs
+      changed_when: fill_runs.stdout | trim | int > 0
+
+    - name: Measure free space on the data volume
+      ansible.builtin.command:
+        argv: [df, --block-size=1M, --output=avail, "{{ pg_home }}"]
+      register: data_volume_df
+      changed_when: false
+
+    - name: Require the data volume to be full
+      ansible.builtin.assert:
+        that:
+          - data_volume_df.stdout_lines[-1] | trim | int <= 1
+        fail_msg: >-
+          Expected no free space on {{ pg_home }} after {{ fill_runs.stdout | trim }}
+          backup runs, found {{ data_volume_df.stdout_lines[-1] | trim }} MiB.
+
+    - name: Write orders until PostgreSQL needs space it does not have
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: incident-probe
+          note: "{{ probe_note }}"
+        status_code: [201, 500, 503]
+        return_content: true
+      register: incident_write
+      retries: 20
+      delay: 1
+      until: incident_write.status != 201
+
+    - name: Require new orders to be rejected
+      ansible.builtin.assert:
+        that:
+          - incident_write.status in [500, 503]
+        fail_msg: >-
+          Expected the application to reject new orders, got HTTP
+          {{ incident_write.status }}: {{ incident_write.content | default('') }}
+        success_msg: >-
+          New orders are rejected: HTTP {{ incident_write.status }}
+          {{ incident_write.json.detail | default(incident_write.content | default('')) }}

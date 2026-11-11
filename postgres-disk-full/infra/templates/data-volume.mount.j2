@@ -1,0 +1,11 @@
+[Unit]
+Description=IncidentSim PostgreSQL data volume
+
+[Mount]
+What={{ data_volume_image }}
+Where={{ pg_home }}
+Type=ext4
+Options=loop,noatime
+
+[Install]
+WantedBy=local-fs.target

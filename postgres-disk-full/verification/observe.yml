@@ -1,0 +1,75 @@
+---
+- name: Wait for the next sample
+  ansible.builtin.pause:
+    seconds: "{{ sample_interval }}"
+  when: sample_index | int > 0
+
+- name: Save a test order through the application
+  ansible.builtin.uri:
+    url: "{{ app_url }}/orders"
+    method: POST
+    body_format: json
+    body:
+      item: "verification-{{ sample_index }}"
+      note: "{{ probe_note }}"
+    status_code: [201]
+    return_content: true
+    timeout: 10
+  register: probe_write
+  failed_when: false
+
+- name: Require the order to be accepted
+  ansible.builtin.assert:
+    that:
+      - probe_write.status == 201
+      - probe_write.json.id is defined
+    success_msg: "Sample {{ sample_index }}: order {{ probe_write.json.id | default('?') }} saved."
+    fail_msg: >-
+      Sample {{ sample_index }}: expected HTTP 201 from POST /orders, got
+      {{ probe_write.status }}: {{ probe_write.content | default(probe_write.msg) | default('') }}
+
+- name: Read the test order back
+  ansible.builtin.uri:
+    url: "{{ app_url }}/orders/{{ probe_write.json.id }}"
+    return_content: true
+    status_code: [200]
+    timeout: 10
+  register: probe_read
+  failed_when: false
+
+- name: Require the stored order to match
+  ansible.builtin.assert:
+    that:
+      - probe_read.status == 200
+      - probe_read.json.item == "verification-" ~ sample_index
+      - probe_read.json.note == probe_note
+    quiet: true
+    fail_msg: >-
+      Sample {{ sample_index }}: order {{ probe_write.json.id }} was not read back
+      unchanged (HTTP {{ probe_read.status }}).
+
+- name: Measure free space on the PostgreSQL data filesystem
+  ansible.builtin.command:
+    argv: [df, --block-size=1M, --output=avail, "{{ data_directory }}"]
+  register: free_space
+  changed_when: false
+
+- name: Read the result of the latest backup run
+  ansible.builtin.command:
+    argv:
+      - systemctl
+      - show
+      - "{{ backup_service }}"
+      - --property=ExecMainExitTimestampMonotonic
+      - --property=ExecMainStatus
+  register: backup_state
+  changed_when: false
+
+- name: Record the sample
+  ansible.builtin.set_fact:
+    free_samples: "{{ free_samples + [free_space.stdout_lines[-1] | trim | int] }}"
+    backup_samples: >-
+      {{ backup_samples + [{
+           'exit_ts': backup_state.stdout | regex_search('ExecMainExitTimestampMonotonic=(\d+)', '\1') | first,
+           'status': backup_state.stdout | regex_search('ExecMainStatus=(\d+)', '\1') | first
+         }] }}

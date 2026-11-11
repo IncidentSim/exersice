@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the IncidentSim database backup every {{ backup_interval }}
+
+[Timer]
+OnActiveSec=5s
+OnUnitActiveSec={{ backup_interval }}
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

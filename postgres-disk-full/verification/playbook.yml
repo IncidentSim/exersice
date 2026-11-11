@@ -1,0 +1,95 @@
+---
+- name: Verify postgres-disk-full from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    backup_service: incidentsim-backup.service
+    # Observation window: 13 samples, 10 seconds apart (120 seconds).
+    sample_count: 13
+    sample_interval: 10
+    # The backup timer runs every 15 seconds: expect at least 5 of ~8 runs.
+    min_backup_runs: 5
+    # A single backup of the exercise database is about 17 MiB.
+    min_free_mib: 48
+    max_free_decline_mib: 40
+    probe_note: "{{ 'v' * 1500 }}"
+
+  tasks:
+    - name: Ask PostgreSQL where its data is stored
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - SHOW data_directory
+        chdir: /
+      register: data_directory_query
+      changed_when: false
+      failed_when: false
+
+    - name: Require PostgreSQL to accept connections
+      ansible.builtin.assert:
+        that:
+          - data_directory_query.rc == 0
+          - data_directory_query.stdout | trim | length > 0
+        fail_msg: >-
+          PostgreSQL does not accept local connections:
+          {{ data_directory_query.stderr | default('') | trim }}
+
+    - name: Start the observation window
+      ansible.builtin.set_fact:
+        data_directory: "{{ data_directory_query.stdout | trim }}"
+        free_samples: []
+        backup_samples: []
+
+    - name: Observe writes, free space, and backups
+      ansible.builtin.include_tasks: observe.yml
+      loop: "{{ range(sample_count) | list }}"
+      loop_control:
+        loop_var: sample_index
+
+    - name: Summarize the observation window
+      ansible.builtin.set_fact:
+        free_decline_mib: "{{ free_samples[0] - (free_samples | min) }}"
+        successful_backup_runs: >-
+          {{ backup_samples
+             | rejectattr('exit_ts', 'equalto', backup_samples[0].exit_ts)
+             | selectattr('status', 'equalto', '0')
+             | map(attribute='exit_ts')
+             | unique
+             | list
+             | length }}
+
+    - name: Require backups to keep running
+      ansible.builtin.assert:
+        that:
+          - successful_backup_runs | int >= min_backup_runs
+        success_msg: "{{ successful_backup_runs }} backups finished successfully during the window."
+        fail_msg: >-
+          Expected at least {{ min_backup_runs }} successful runs of {{ backup_service }}
+          in {{ (sample_count - 1) * sample_interval }} seconds, observed
+          {{ successful_backup_runs }}. Backups must not be disabled or slowed down.
+
+    - name: Require stable free space on the PostgreSQL data filesystem
+      ansible.builtin.assert:
+        that:
+          - free_samples | min >= min_free_mib
+          - free_decline_mib | int <= max_free_decline_mib
+        success_msg: >-
+          Free space on the data filesystem stayed between {{ free_samples | min }}
+          and {{ free_samples | max }} MiB.
+        fail_msg: >-
+          Expected at least {{ min_free_mib }} MiB free and a decline of at most
+          {{ max_free_decline_mib }} MiB on the filesystem of {{ data_directory }}.
+          Observed free space (MiB): {{ free_samples | join(', ') }};
+          decline {{ free_decline_mib }} MiB.

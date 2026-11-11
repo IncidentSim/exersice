@@ -1,0 +1,609 @@
+---
+- name: Deploy the healthy postgres-disk-full infrastructure
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+
+  vars:
+    exercise_root: /opt/incidentctl/postgres-disk-full
+    app_root: "{{ exercise_root }}/orders-api"
+    app_user: orders_api
+    app_port: 8080
+    app_url: "http://127.0.0.1:{{ app_port }}"
+    app_database: incidentsim
+    postgresql_package_version: 16.15-0ubuntu0.24.04.1
+    psycopg2_package_version: 2.9.9-1build1
+    pg_unit: postgresql@16-main.service
+    pg_conf_dir: /etc/postgresql/16/main
+    pg_bin_dir: /usr/lib/postgresql/16/bin
+    pg_home: /var/lib/postgresql
+    pg_data_dir: "{{ pg_home }}/16/main"
+    data_volume_image: /srv/incidentsim/pgdata.img
+    data_volume_size: 256M
+    data_volume_unit: var-lib-postgresql.mount
+    # Leave clear headroom above the verification floor (48 MiB).
+    data_volume_min_free_mib: 80
+    history_rows: 120000
+    backup_script: /usr/local/lib/incidentsim/backup.sh
+    backup_env_file: /etc/incidentsim/backup.env
+    backup_dir: /var/backups/incidentsim
+    backup_keep: 5
+    backup_interval: 15s
+    backup_service: incidentsim-backup.service
+    backup_timer: incidentsim-backup.timer
+
+  tasks:
+    - name: Require Ubuntu 24.04
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_version is version("24.04", ">=")
+          - ansible_facts.distribution_version is version("24.10", "<")
+        fail_msg: This exercise requires Ubuntu 24.04.
+
+    # --- Dedicated data volume -------------------------------------------
+
+    - name: Create the data volume image directory
+      ansible.builtin.file:
+        path: "{{ data_volume_image | dirname }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Allocate the data volume image
+      ansible.builtin.command:
+        argv: [fallocate, --length, "{{ data_volume_size }}", "{{ data_volume_image }}"]
+        creates: "{{ data_volume_image }}"
+
+    - name: Detect the data volume filesystem
+      ansible.builtin.command:
+        argv: [blkid, --probe, --output, value, --match-tag, TYPE, "{{ data_volume_image }}"]
+      register: data_volume_fs
+      changed_when: false
+      failed_when: data_volume_fs.rc not in [0, 2]
+
+    - name: Refuse to overwrite an unexpected filesystem
+      ansible.builtin.assert:
+        that:
+          - data_volume_fs.rc == 2 or data_volume_fs.stdout == "ext4"
+        fail_msg: >-
+          {{ data_volume_image }} contains a {{ data_volume_fs.stdout }} filesystem
+          instead of ext4. Remove the image manually to recreate the volume.
+
+    - name: Format the data volume without root-reserved blocks
+      ansible.builtin.command:
+        argv: [mkfs.ext4, -q, -F, -m, "0", -L, pgdata, "{{ data_volume_image }}"]
+      when: data_volume_fs.rc == 2
+      changed_when: true
+
+    - name: Install the data volume mount unit
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/data-volume.mount.j2"
+        dest: "/etc/systemd/system/{{ data_volume_unit }}"
+        owner: root
+        group: root
+        mode: "0644"
+      register: data_volume_mount_unit
+
+    - name: Mount the data volume
+      block:
+        - name: Enable and start the data volume mount
+          ansible.builtin.systemd_service:
+            name: "{{ data_volume_unit }}"
+            enabled: true
+            state: "{{ 'restarted' if data_volume_mount_unit.changed else 'started' }}"
+            daemon_reload: true
+      rescue:
+        - name: Explain the data volume mount failure
+          ansible.builtin.fail:
+            msg: >-
+              Could not mount the loop-backed volume {{ data_volume_image }} at {{ pg_home }}.
+              The VM must allow loop devices (check `losetup --find`) and ext4 mounts.
+
+    - name: Read the data volume mount
+      ansible.builtin.command:
+        argv: [findmnt, --noheadings, --output, FSTYPE, --mountpoint, "{{ pg_home }}"]
+      register: data_volume_mount
+      changed_when: false
+      failed_when: false
+
+    - name: Require the data volume to be mounted
+      ansible.builtin.assert:
+        that:
+          - data_volume_mount.rc == 0
+          - data_volume_mount.stdout | trim == "ext4"
+        fail_msg: "{{ pg_home }} is not mounted from the ext4 data volume."
+
+    # --- PostgreSQL ------------------------------------------------------
+
+    # The package creates its cluster under the postgres home directory. Create
+    # the account first (the package reuses an existing system user) so the
+    # freshly formatted volume root can belong to postgres before installation.
+    - name: Create the postgres system group
+      ansible.builtin.group:
+        name: postgres
+        system: true
+
+    - name: Create the postgres system user
+      ansible.builtin.user:
+        name: postgres
+        group: postgres
+        system: true
+        home: "{{ pg_home }}"
+        create_home: false
+        shell: /bin/bash
+        comment: PostgreSQL administrator
+
+    - name: Give the PostgreSQL home on the data volume to postgres
+      ansible.builtin.file:
+        path: "{{ pg_home }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0755"
+
+    - name: Install PostgreSQL and the application driver at recorded versions
+      ansible.builtin.apt:
+        name:
+          - "postgresql-16={{ postgresql_package_version }}"
+          - "postgresql-client-16={{ postgresql_package_version }}"
+          - "python3-psycopg2={{ psycopg2_package_version }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+        policy_rc_d: 101
+
+    - name: Check the cluster data directory on the data volume
+      ansible.builtin.stat:
+        path: "{{ pg_data_dir }}/PG_VERSION"
+      register: pg_data_version
+
+    - name: Remove a cluster definition whose data is not on the volume
+      ansible.builtin.command:
+        argv: [pg_dropcluster, --stop, "16", main]
+      when: not pg_data_version.stat.exists
+      register: pg_dropcluster
+      changed_when: pg_dropcluster.rc == 0
+      failed_when: false
+
+    - name: Create the main cluster on the data volume
+      ansible.builtin.command:
+        argv: [pg_createcluster, --port, "5432", "16", main]
+      when: not pg_data_version.stat.exists
+      changed_when: true
+
+    - name: Create the PostgreSQL systemd override directory
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ pg_unit }}.d"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Start PostgreSQL only after the data volume is mounted
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/postgresql-systemd-override.conf.j2"
+        dest: "/etc/systemd/system/{{ pg_unit }}.d/incidentsim.conf"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    # Restoring the baseline after the incident: backups stored on the data
+    # volume are not part of the healthy state.
+    - name: Find database dumps stored on the data volume
+      ansible.builtin.find:
+        paths: "{{ pg_home }}"
+        patterns: "{{ app_database }}-*.sql"
+        recurse: true
+        file_type: file
+      register: data_volume_dumps
+
+    - name: Check for a backup directory on the data volume
+      ansible.builtin.stat:
+        path: "{{ pg_home }}/backups"
+      register: data_volume_backup_dir
+
+    - name: Remove backups from the data volume
+      when: data_volume_dumps.matched > 0 or data_volume_backup_dir.stat.exists
+      block:
+        - name: Check whether the backup timer is installed
+          ansible.builtin.stat:
+            path: "/etc/systemd/system/{{ backup_timer }}"
+          register: backup_timer_unit
+
+        - name: Pause the backup timer during cleanup
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            state: stopped
+          loop:
+            - "{{ backup_timer }}"
+            - "{{ backup_service }}"
+          when: backup_timer_unit.stat.exists
+
+        - name: Delete dumps from the data volume
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ data_volume_dumps.files }}"
+          loop_control:
+            label: "{{ item.path }}"
+
+        - name: Delete the backup directory from the data volume
+          ansible.builtin.file:
+            path: "{{ pg_home }}/backups"
+            state: absent
+
+    - name: Install the healthy PostgreSQL settings
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/postgresql.conf.j2"
+        dest: "{{ pg_conf_dir }}/conf.d/50-incidentsim.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    - name: Install the PostgreSQL monitoring settings
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/monitoring/postgresql-monitoring.conf.j2"
+        dest: "{{ pg_conf_dir }}/conf.d/90-incidentsim-monitoring.conf"
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PostgreSQL
+
+    - name: Enable and start PostgreSQL
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+
+    - name: Apply PostgreSQL changes before creating the schema
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for PostgreSQL to accept connections
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, pg_isready, --quiet]
+      register: pg_ready
+      changed_when: false
+      failed_when: false
+      retries: 15
+      delay: 2
+      until: pg_ready.rc == 0
+
+    - name: Require PostgreSQL to be ready
+      ansible.builtin.assert:
+        that:
+          - pg_ready.rc == 0
+        fail_msg: "PostgreSQL did not accept connections (pg_isready rc={{ pg_ready.rc }})."
+
+    # --- Database and application ----------------------------------------
+
+    - name: Create the application directory
+      ansible.builtin.file:
+        path: "{{ app_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Copy the orders-api source and schema
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../apps/orders-api/{{ item }}"
+        dest: "{{ app_root }}/{{ item }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - app.py
+        - schema.sql
+      register: app_files
+      notify: Restart orders-api
+
+    - name: Check whether the application database exists
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --command
+          - "SELECT count(*) FROM pg_database WHERE datname = '{{ app_database }}'"
+        chdir: /
+      register: app_database_exists
+      changed_when: false
+
+    - name: Create the application database
+      ansible.builtin.command:
+        argv: [runuser, -u, postgres, --, createdb, "{{ app_database }}"]
+        chdir: /
+      when: app_database_exists.stdout | trim == "0"
+      changed_when: true
+
+    - name: Check the application schema and grants
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - >-
+            SELECT to_regclass('public.orders') IS NOT NULL
+               AND to_regclass('public.order_history') IS NOT NULL
+               AND EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ app_user }}')
+               AND has_table_privilege('{{ app_user }}', 'public.orders', 'INSERT')
+               AND has_table_privilege('{{ app_user }}', 'public.orders', 'SELECT')
+        chdir: /
+      register: app_schema_ready
+      changed_when: false
+
+    - name: Apply the application schema
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --file
+          - "{{ app_root }}/schema.sql"
+        chdir: /
+      when: app_schema_ready.stdout | trim != "t" or app_files.changed
+      changed_when: true
+
+    - name: Count rows in the order history
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --tuples-only
+          - --no-align
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - SELECT count(*) FROM order_history
+        chdir: /
+      register: history_count
+      changed_when: false
+
+    - name: Load the order history that makes up most of each backup
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - psql
+          - --no-psqlrc
+          - --quiet
+          - --set
+          - ON_ERROR_STOP=1
+          - --dbname
+          - "{{ app_database }}"
+          - --command
+          - >-
+            INSERT INTO order_history (item, note, created_at)
+            SELECT 'sku-' || lpad((g % 5000)::text, 5, '0'),
+                   repeat(md5(g::text), 3),
+                   now() - g * interval '1 minute'
+            FROM generate_series(1, {{ history_rows }}) AS g
+        chdir: /
+      when: history_count.stdout | trim == "0"
+      changed_when: true
+
+    - name: Create the orders-api system user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        home: /nonexistent
+        create_home: false
+
+    - name: Install the orders-api systemd unit
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/orders-api.service.j2"
+        dest: /etc/systemd/system/incidentsim-orders-api.service
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart orders-api
+
+    - name: Enable the orders-api service
+      ansible.builtin.systemd_service:
+        name: incidentsim-orders-api.service
+        enabled: true
+        daemon_reload: true
+        state: started
+
+    # --- Backups ---------------------------------------------------------
+
+    - name: Create the backup directory on the root filesystem
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0750"
+
+    - name: Create the backup script and configuration directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ backup_script | dirname }}"
+        - "{{ backup_env_file | dirname }}"
+
+    - name: Install the backup script
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../apps/backup-job/backup.sh"
+        dest: "{{ backup_script }}"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install the healthy backup configuration
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/backup.env.j2"
+        dest: "{{ backup_env_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Install the backup service and timer units
+      ansible.builtin.template:
+        src: "{{ playbook_dir }}/templates/{{ item.src }}"
+        dest: "/etc/systemd/system/{{ item.dest }}"
+        owner: root
+        group: root
+        mode: "0644"
+      loop:
+        - { src: backup.service.j2, dest: "{{ backup_service }}" }
+        - { src: backup.timer.j2, dest: "{{ backup_timer }}" }
+      notify: Restart backup timer
+
+    - name: Enable and start the backup timer
+      ansible.builtin.systemd_service:
+        name: "{{ backup_timer }}"
+        enabled: true
+        masked: false
+        state: started
+        daemon_reload: true
+
+    - name: Apply service changes before smoke tests
+      ansible.builtin.meta: flush_handlers
+
+    # --- Smoke tests -----------------------------------------------------
+
+    - name: Wait for the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        return_content: true
+        status_code: 200
+      register: app_health
+      retries: 15
+      delay: 2
+      until: app_health.status == 200
+
+    - name: Save a smoke-test order
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders"
+        method: POST
+        body_format: json
+        body:
+          item: infra-smoke
+          note: saved by the infra playbook
+        status_code: 201
+        return_content: true
+      register: smoke_write
+
+    - name: Read the smoke-test order back
+      ansible.builtin.uri:
+        url: "{{ app_url }}/orders/{{ smoke_write.json.id }}"
+        return_content: true
+        status_code: 200
+      register: smoke_read
+
+    - name: Require the order to be stored
+      ansible.builtin.assert:
+        that:
+          - smoke_read.json.item == "infra-smoke"
+        fail_msg: The healthy infrastructure did not store the smoke-test order.
+
+    # Starting a oneshot unit blocks until the backup finishes. The produced
+    # dump is part of the normal rotation, so the run is not reported as a change.
+    - name: Run one backup through the healthy backup path
+      ansible.builtin.command:
+        argv: [systemctl, start, "{{ backup_service }}"]
+      changed_when: false
+
+    - name: Find backups in the healthy backup directory
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns: "{{ app_database }}-*.sql"
+        size: 1m
+      register: healthy_backups
+
+    - name: Require a non-trivial backup outside the data volume
+      ansible.builtin.assert:
+        that:
+          - healthy_backups.matched >= 1
+          - healthy_backups.matched <= backup_keep
+        fail_msg: >-
+          Expected 1..{{ backup_keep }} backups larger than 1 MiB in {{ backup_dir }},
+          found {{ healthy_backups.matched }}.
+
+    - name: Measure free space on the data volume
+      ansible.builtin.command:
+        argv: [df, --block-size=1M, --output=avail, "{{ pg_data_dir }}"]
+      register: data_volume_df
+      changed_when: false
+
+    - name: Require headroom on the data volume
+      ansible.builtin.assert:
+        that:
+          - data_volume_df.stdout_lines[-1] | trim | int >= data_volume_min_free_mib
+        fail_msg: >-
+          Expected at least {{ data_volume_min_free_mib }} MiB free on the data volume,
+          found {{ data_volume_df.stdout_lines[-1] | trim }} MiB.
+
+  handlers:
+    - name: Validate PostgreSQL configuration
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - "{{ pg_bin_dir }}/postgres"
+          - "--config-file={{ pg_conf_dir }}/postgresql.conf"
+          - -C
+          - shared_buffers
+        chdir: /
+      changed_when: false
+      listen: Restart PostgreSQL
+
+    - name: Restart PostgreSQL service
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        daemon_reload: true
+        state: restarted
+      listen: Restart PostgreSQL
+
+    - name: Restart orders-api
+      ansible.builtin.systemd_service:
+        name: incidentsim-orders-api.service
+        daemon_reload: true
+        state: restarted
+
+    - name: Restart backup timer
+      ansible.builtin.systemd_service:
+        name: "{{ backup_timer }}"
+        daemon_reload: true
+        state: restarted
