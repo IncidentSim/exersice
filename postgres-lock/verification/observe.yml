@@ -1,0 +1,31 @@
+---
+- name: Wait for the next sample
+  ansible.builtin.pause:
+    seconds: "{{ sample_interval }}"
+  when: sample_index | int > 0
+
+# The request timeout is the latency budget: a write that waits for a lock
+# longer than write_timeout seconds fails with status -1.
+- name: Save a test order through the application
+  ansible.builtin.uri:
+    url: "{{ app_url }}/orders"
+    method: POST
+    body_format: json
+    body:
+      item: "verification-{{ sample_index }}"
+      note: lock check
+    status_code: [201]
+    return_content: true
+    timeout: "{{ write_timeout }}"
+  register: probe_write
+  failed_when: false
+
+- name: Require the order to be saved in time
+  ansible.builtin.assert:
+    that:
+      - probe_write.status == 201
+    success_msg: "Sample {{ sample_index }}: order {{ probe_write.json.id | default('?') }} saved."
+    fail_msg: >-
+      Sample {{ sample_index }}: expected POST /orders to return HTTP 201 within
+      {{ write_timeout }} s, got {{ probe_write.status }}:
+      {{ probe_write.content | default(probe_write.msg) | default('') }}

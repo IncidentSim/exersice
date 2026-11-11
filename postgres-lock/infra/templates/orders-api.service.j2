@@ -1,0 +1,18 @@
+[Unit]
+Description=IncidentSim orders-api
+After=network.target {{ pg_unit }}
+Wants={{ pg_unit }}
+
+[Service]
+Type=simple
+User={{ app_user }}
+Group={{ app_user }}
+Environment=APP_HOST=127.0.0.1
+Environment=APP_PORT={{ app_port }}
+Environment="DATABASE_DSN=host=/var/run/postgresql dbname={{ app_database }} user={{ app_user }}"
+ExecStart=/usr/bin/python3 {{ app_root }}/app.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

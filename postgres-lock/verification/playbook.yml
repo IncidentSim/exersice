@@ -1,0 +1,38 @@
+---
+- name: Verify postgres-lock from the client perspective
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    # Observation window: 13 samples, 10 seconds apart (120 seconds).
+    sample_count: 13
+    sample_interval: 10
+    # Every order must be saved faster than this many seconds.
+    write_timeout: 1
+
+  tasks:
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        return_content: true
+        status_code: [200]
+        timeout: 5
+      register: app_health
+      failed_when: false
+
+    - name: Require the application to reach the database
+      ansible.builtin.assert:
+        that:
+          - app_health.status == 200
+        fail_msg: >-
+          Expected HTTP 200 from /healthz, got {{ app_health.status }}:
+          {{ app_health.content | default(app_health.msg) | default('') }}
+
+    - name: Save orders throughout the observation window
+      ansible.builtin.include_tasks: observe.yml
+      loop: "{{ range(sample_count) | list }}"
+      loop_control:
+        loop_var: sample_index
