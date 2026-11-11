@@ -36,7 +36,7 @@ are reserved for roles with the SUPERUSER attribute"}
 2. Суперпользователь подключается через зарезервированный слот. Кто держит сессии:
 
    ```bash
-   sudo -u postgres psql -c "
+   runuser -u postgres -- psql -c "
      SELECT usename, application_name, state, count(*),
             min(backend_start) AS oldest, max(state_change) AS last_activity
      FROM pg_stat_activity
@@ -55,7 +55,7 @@ are reserved for roles with the SUPERUSER attribute"}
 3. После перезапуска PostgreSQL число сессий `report_worker` растёт на одну каждые ~4 секунды:
 
    ```bash
-   watch -n 5 "sudo -u postgres psql -Atc \"SELECT count(*) FROM pg_stat_activity WHERE usename = 'report_worker'\""
+   watch -n 5 "runuser -u postgres -- psql -Atc \"SELECT count(*) FROM pg_stat_activity WHERE usename = 'report_worker'\""
    ```
 
 4. Источник:
@@ -81,7 +81,7 @@ are reserved for roles with the SUPERUSER attribute"}
 
 ```bash
 systemctl disable --now incidentsim-report-worker.service
-sudo -u postgres psql -c "SELECT count(*) FROM pg_stat_activity WHERE usename = 'report_worker'"
+runuser -u postgres -- psql -c "SELECT count(*) FROM pg_stat_activity WHERE usename = 'report_worker'"
 ```
 
 Сессии закрываются вместе с процессом. Если воркер нужен, его код надо исправить (закрывать соединение после отчёта) до повторного запуска.
@@ -90,12 +90,12 @@ sudo -u postgres psql -c "SELECT count(*) FROM pg_stat_activity WHERE usename = 
 
 ```bash
 # не больше 5 сессий для роли воркера
-sudo -u postgres psql \
+runuser -u postgres -- psql \
   -c "ALTER ROLE report_worker CONNECTION LIMIT 5" \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'report_worker'"
 
 # или закрывать простаивающие сессии через 30 секунд
-sudo -u postgres psql \
+runuser -u postgres -- psql \
   -c "ALTER SYSTEM SET idle_session_timeout = '30s'" \
   -c "SELECT pg_reload_conf()" \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'report_worker'"
