@@ -1,0 +1,92 @@
+---
+- name: Introduce the moved PostgreSQL port incident
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+
+  vars:
+    app_url: http://127.0.0.1:8080
+    pg_unit: postgresql@16-main.service
+    pg_conf_dir: /etc/postgresql/16/main
+    pg_bin_dir: /usr/lib/postgresql/16/bin
+    pg_settings_file: "{{ pg_conf_dir }}/conf.d/50-incidentsim.conf"
+    incident_port: 5433
+
+  tasks:
+    - name: Check the exercise PostgreSQL settings
+      ansible.builtin.stat:
+        path: "{{ pg_settings_file }}"
+      register: settings_file
+
+    - name: Check the orders-api health endpoint
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+      register: app_health
+      failed_when: false
+
+    - name: Require the infrastructure to be deployed first
+      ansible.builtin.assert:
+        that:
+          - settings_file.stat.isreg | default(false)
+          - app_health.status in [200, 503]
+        fail_msg: Run the infra playbook before introducing the incident.
+
+    - name: Move PostgreSQL to another port
+      ansible.builtin.lineinfile:
+        path: "{{ pg_settings_file }}"
+        regexp: '^port\s*='
+        line: "port = {{ incident_port }}"
+      register: port_change
+
+    - name: Validate PostgreSQL configuration
+      ansible.builtin.command:
+        argv:
+          - runuser
+          - -u
+          - postgres
+          - --
+          - "{{ pg_bin_dir }}/postgres"
+          - "--config-file={{ pg_conf_dir }}/postgresql.conf"
+          - -C
+          - port
+        chdir: /
+      register: configured_port
+      changed_when: false
+      failed_when: configured_port.rc != 0 or configured_port.stdout | trim != incident_port | string
+
+    - name: Restart PostgreSQL on the new port
+      ansible.builtin.systemd_service:
+        name: "{{ pg_unit }}"
+        state: restarted
+      when: port_change.changed
+
+    - name: Wait for PostgreSQL on the new port
+      ansible.builtin.command:
+        argv: [pg_isready, --host=127.0.0.1, "--port={{ incident_port }}", --quiet]
+      register: new_port_ready
+      changed_when: false
+      failed_when: false
+      retries: 15
+      delay: 2
+      until: new_port_ready.rc == 0
+
+    - name: Check the orders-api health endpoint after the change
+      ansible.builtin.uri:
+        url: "{{ app_url }}/healthz"
+        status_code: [200, 503]
+        return_content: true
+      register: incident_health
+
+    - name: Require the application to lose the database
+      ansible.builtin.assert:
+        that:
+          - new_port_ready.rc == 0
+          - incident_health.status == 503
+          - "'Connection refused' in incident_health.json.detail | default('')"
+        fail_msg: >-
+          Expected PostgreSQL on port {{ incident_port }} and HTTP 503 with
+          "Connection refused", got pg_isready rc={{ new_port_ready.rc }} and HTTP
+          {{ incident_health.status }}: {{ incident_health.content | default('') }}
+        success_msg: "{{ incident_health.json.detail | default('') }}"
