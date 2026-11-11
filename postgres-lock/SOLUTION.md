@@ -26,7 +26,7 @@ Sample 0: expected POST /orders to return HTTP 201 within 1 s, got -1:
 1. Что делают сессии базы:
 
    ```bash
-   sudo -u postgres psql incidentsim -c "
+   runuser -u postgres -- psql incidentsim -c "
      SELECT pid, usename, application_name, state, wait_event_type,
             pg_blocking_pids(pid) AS blocked_by,
             now() - xact_start AS xact_age, left(query, 50) AS query
@@ -46,7 +46,7 @@ Sample 0: expected POST /orders to return HTTP 201 within 1 s, got -1:
 2. Какая блокировка держится:
 
    ```bash
-   sudo -u postgres psql incidentsim -c "
+   runuser -u postgres -- psql incidentsim -c "
      SELECT l.pid, l.mode, l.granted, a.application_name
      FROM pg_locks l JOIN pg_stat_activity a USING (pid)
      WHERE l.relation = 'orders'::regclass"
@@ -82,7 +82,7 @@ Sample 0: expected POST /orders to return HTTP 201 within 1 s, got -1:
 
 ```bash
 systemctl disable --now incidentsim-nightly-fix.service
-sudo -u postgres psql incidentsim -c \
+runuser -u postgres -- psql incidentsim -c \
   "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'nightly_fix'"
 ```
 
@@ -91,7 +91,7 @@ sudo -u postgres psql incidentsim -c \
 Допустимый вариант — запретить долгие простаивающие транзакции на уровне сервера:
 
 ```bash
-sudo -u postgres psql incidentsim \
+runuser -u postgres -- psql incidentsim \
   -c "ALTER SYSTEM SET idle_in_transaction_session_timeout = '5s'" \
   -c "SELECT pg_reload_conf()" \
   -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'nightly_fix'"
