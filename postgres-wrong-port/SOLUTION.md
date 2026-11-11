@@ -2,7 +2,7 @@
 
 ## Краткий ответ
 
-В `/etc/postgresql/16/main/conf.d/50-incidentsim.conf` порт кластера изменён на `5433`, а приложение по контракту подключается к `127.0.0.1:5432`. Сервис PostgreSQL при этом `active`, а `sudo -u postgres psql` работает: обёртка `pg_wrapper` в Ubuntu сама берёт порт кластера из его конфигурации.
+В `/etc/postgresql/16/main/conf.d/50-incidentsim.conf` порт кластера изменён на `5433`, а приложение по контракту подключается к `127.0.0.1:5432`. Сервис PostgreSQL при этом `active`, а `runuser -u postgres -- psql` работает: обёртка `pg_wrapper` в Ubuntu сама берёт порт кластера из его конфигурации.
 
 Исправление — вернуть `port = 5432` и перезапустить кластер.
 
@@ -34,7 +34,7 @@ pg_isready reported: 127.0.0.1:5432 - no response (rc=2)
 
    ```bash
    systemctl is-active postgresql@16-main
-   sudo -u postgres psql -c 'SELECT 1'
+   runuser -u postgres -- psql -c 'SELECT 1'
    ```
 
 3. На каком порту на самом деле слушает кластер:
@@ -49,7 +49,7 @@ pg_isready reported: 127.0.0.1:5432 - no response (rc=2)
 4. Где задан порт:
 
    ```bash
-   sudo -u postgres psql -c \
+   runuser -u postgres -- psql -c \
      "SELECT name, setting, sourcefile, sourceline FROM pg_settings WHERE name = 'port'"
    ```
 
@@ -65,7 +65,7 @@ pg_isready reported: 127.0.0.1:5432 - no response (rc=2)
 
 ```bash
 sed -i 's/^port = 5433$/port = 5432/' /etc/postgresql/16/main/conf.d/50-incidentsim.conf
-sudo -u postgres /usr/lib/postgresql/16/bin/postgres \
+runuser -u postgres -- /usr/lib/postgresql/16/bin/postgres \
   --config-file=/etc/postgresql/16/main/postgresql.conf -C port
 systemctl restart postgresql@16-main
 pg_isready -h 127.0.0.1 -p 5432
