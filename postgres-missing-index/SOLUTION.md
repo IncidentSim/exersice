@@ -42,7 +42,7 @@ Customer 69885: expected HTTP 200 with 120 sales within 0.1 s, got 200 0.484210
 2. План запроса:
 
    ```bash
-   sudo -u postgres psql incidentsim -c \
+   runuser -u postgres -- psql incidentsim -c \
      "EXPLAIN (ANALYZE, BUFFERS) SELECT count(*), sum(amount) FROM sales WHERE customer_id = 4242"
    ```
 
@@ -59,7 +59,7 @@ Customer 69885: expected HTTP 200 with 120 sales within 0.1 s, got 200 0.484210
 3. Индексы таблицы:
 
    ```bash
-   sudo -u postgres psql incidentsim -c '\d sales'
+   runuser -u postgres -- psql incidentsim -c '\d sales'
    ```
 
    Есть только первичный ключ `sales_pkey`; индекса по `customer_id` нет.
@@ -73,7 +73,7 @@ Customer 69885: expected HTTP 200 with 120 sales within 0.1 s, got 200 0.484210
 ## Исправление вручную
 
 ```bash
-sudo -u postgres psql incidentsim \
+runuser -u postgres -- psql incidentsim \
   -c 'CREATE INDEX CONCURRENTLY sales_customer_id_idx ON sales (customer_id)' \
   -c 'ANALYZE sales'
 ```
@@ -83,7 +83,7 @@ sudo -u postgres psql incidentsim \
 Проверить план после исправления:
 
 ```bash
-sudo -u postgres psql incidentsim -c \
+runuser -u postgres -- psql incidentsim -c \
   "EXPLAIN (ANALYZE) SELECT count(*), sum(amount) FROM sales WHERE customer_id = 4242"
 ```
 
