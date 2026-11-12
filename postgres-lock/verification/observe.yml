@@ -21,11 +21,11 @@
   failed_when: false
 
 - name: Require the order to be saved in time
-  ansible.builtin.assert:
-    that:
-      - probe_write.status == 201
-    success_msg: "Sample {{ sample_index }}: order {{ probe_write.json.id | default('?') }} saved."
-    fail_msg: >-
-      Sample {{ sample_index }}: expected POST /orders to return HTTP 201 within
-      {{ write_timeout }} s, got {{ probe_write.status }}:
-      {{ probe_write.content | default(probe_write.msg) | default('') }}
+  incidentsim.verify.check:
+    id: "writes.saved.{{ '%02d' | format(sample_index | int) }}"
+    description: "Sample {{ sample_index }}: the order is saved within {{ write_timeout }} s"
+    passed: "{{ (probe_write | incidentsim.verify.dig('status')) == 201 }}"
+    error: "{{ probe_write | incidentsim.verify.technical_error }}"
+    observed: "HTTP {{ probe_write | incidentsim.verify.dig('status', 'no response') }}"
+    expected: "HTTP 201 within {{ write_timeout }} s"
+    evidence: "{{ (probe_write | incidentsim.verify.dig('content')) or (probe_write | incidentsim.verify.dig('msg', '')) }}"

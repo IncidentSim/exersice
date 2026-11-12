@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -59,12 +60,14 @@ def make_handler(app):
                     return self._send(200, app.orders[oid])
                 return self._send(404, {})
             if self.path.startswith("/customers/"):
+                time.sleep(mode.get("latency", 0))
                 return self._send(200, {"orders": mode.get("sales", 3)})
             self._send(404, {})
 
         def do_POST(self):
             if app.mode.get("down") or app.mode.get("write_fail"):
                 return self._send(500, {"error": "write failed"})
+            time.sleep(app.mode.get("write_latency", 0))
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             oid = str(len(app.orders) + 1)

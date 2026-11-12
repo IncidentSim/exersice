@@ -19,14 +19,14 @@
   failed_when: false
 
 - name: Require the order to be accepted
-  ansible.builtin.assert:
-    that:
-      - probe_write.status == 201
-      - probe_write.json.id is defined
-    success_msg: "Sample {{ sample_index }}: order {{ probe_write.json.id | default('?') }} saved."
-    fail_msg: >-
-      Sample {{ sample_index }}: expected HTTP 201 from POST /orders, got
-      {{ probe_write.status }}: {{ probe_write.content | default(probe_write.msg) | default('') }}
+  incidentsim.verify.check:
+    id: "window.accepted.{{ '%02d' | format(sample_index | int) }}"
+    description: "Sample {{ sample_index }}: the order is accepted"
+    passed: "{{ (probe_write | incidentsim.verify.dig('status')) == 201 and (probe_write | incidentsim.verify.dig('json.id')) is not none }}"
+    error: "{{ probe_write | incidentsim.verify.technical_error }}"
+    observed: "HTTP {{ probe_write | incidentsim.verify.dig('status', 'no response') }}"
+    expected: HTTP 201 from POST /orders
+    evidence: "{{ (probe_write | incidentsim.verify.dig('content')) or (probe_write | incidentsim.verify.dig('msg', '')) }}"
 
 - name: Read the test order back
   ansible.builtin.uri:
@@ -38,15 +38,16 @@
   failed_when: false
 
 - name: Require the stored order to match
-  ansible.builtin.assert:
-    that:
-      - probe_read.status == 200
-      - probe_read.json.item == "verification-" ~ sample_index
-      - probe_read.json.note == probe_note
-    quiet: true
-    fail_msg: >-
-      Sample {{ sample_index }}: order {{ probe_write.json.id }} was not read back
-      unchanged (HTTP {{ probe_read.status }}).
+  incidentsim.verify.check:
+    id: "window.readback.{{ '%02d' | format(sample_index | int) }}"
+    description: "Sample {{ sample_index }}: the order is read back unchanged"
+    passed: >-
+      {{ (probe_read | incidentsim.verify.dig('status')) == 200
+         and (probe_read | incidentsim.verify.dig('json.item')) == 'verification-' ~ sample_index
+         and (probe_read | incidentsim.verify.dig('json.note')) == probe_note }}
+    error: "{{ probe_read | incidentsim.verify.technical_error }}"
+    observed: "HTTP {{ probe_read | incidentsim.verify.dig('status', 'no response') }}"
+    expected: "HTTP 200 for order {{ probe_write.json.id }} with the original item and note"
 
 - name: Measure free space on the PostgreSQL data filesystem
   ansible.builtin.command:
@@ -65,9 +66,17 @@
   register: backup_state
   changed_when: false
 
+# A non-numeric df answer becomes an invalid (null) sample: the metrics module
+# drops it and reports it instead of counting it as zero free space.
 - name: Record the sample
   ansible.builtin.set_fact:
-    free_samples: "{{ free_samples + [free_space.stdout_lines[-1] | trim | int] }}"
+    free_samples: >-
+      {{ free_samples + [{
+           'ts': (sample_index | int) * (sample_interval | int),
+           'name': 'free_mib',
+           'labels': {},
+           'value': (free_space.stdout_lines[-1] | trim | int) if (free_space.stdout_lines[-1] | trim) is match('^[0-9]+$') else none
+         }] }}
     backup_samples: >-
       {{ backup_samples + [{
            'exit_ts': backup_state.stdout | regex_search('ExecMainExitTimestampMonotonic=(\d+)', '\1') | first,

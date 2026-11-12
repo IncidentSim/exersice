@@ -24,15 +24,26 @@
       failed_when: false
 
     - name: Require the application to reach the database
-      ansible.builtin.assert:
-        that:
-          - app_health.status == 200
-        fail_msg: >-
-          Expected HTTP 200 from /healthz, got {{ app_health.status }}:
-          {{ app_health.content | default(app_health.msg) | default('') }}
+      incidentsim.verify.check:
+        id: app.health
+        description: The application reaches the database
+        passed: "{{ (app_health | incidentsim.verify.dig('status')) == 200 }}"
+        error: "{{ app_health | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ app_health | incidentsim.verify.dig('status', 'no response') }}"
+        expected: HTTP 200 from /healthz
+        evidence: "{{ (app_health | incidentsim.verify.dig('content')) or (app_health | incidentsim.verify.dig('msg', '')) }}"
 
     - name: Save orders throughout the observation window
       ansible.builtin.include_tasks: observe.yml
       loop: "{{ range(sample_count) | list }}"
       loop_control:
         loop_var: sample_index
+
+    # Reached only when every sample passed its own check.
+    - name: Record that every write was fast enough
+      incidentsim.verify.check:
+        id: writes.all-within-budget
+        description: Every order in the observation window was saved in time
+        passed: true
+        observed: "{{ sample_count }} of {{ sample_count }} writes within {{ write_timeout }} s"
+        expected: "{{ sample_count }} of {{ sample_count }} writes within {{ write_timeout }} s"

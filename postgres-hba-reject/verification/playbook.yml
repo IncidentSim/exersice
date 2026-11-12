@@ -42,14 +42,14 @@
       failed_when: false
 
     - name: Require the correct password to be accepted
-      ansible.builtin.assert:
-        that:
-          - correct_login.rc == 0
-          - correct_login.stdout | trim == app_user
-        success_msg: "{{ app_user }} logs in over TCP with its password."
-        fail_msg: >-
-          Expected {{ app_user }} to log in to {{ app_database }} at 127.0.0.1:5432,
-          got rc={{ correct_login.rc }}: {{ correct_login.stderr | trim }}
+      incidentsim.verify.check:
+        id: db.correct-password-accepted
+        description: The application role logs in over TCP with its password
+        passed: "{{ (correct_login | incidentsim.verify.dig('rc')) == 0 and (correct_login | incidentsim.verify.dig('stdout', '') | trim) == app_user }}"
+        error: "{{ correct_login | incidentsim.verify.technical_error }}"
+        observed: "rc={{ correct_login | incidentsim.verify.dig('rc', '?') }}"
+        expected: "{{ app_user }} logs in to {{ app_database }} at 127.0.0.1:5432 (rc=0)"
+        evidence: "{{ correct_login | incidentsim.verify.dig('stderr', '') | trim }}"
 
     - name: Log in as the application role over TCP with a wrong password
       ansible.builtin.command:
@@ -62,16 +62,17 @@
       changed_when: false
       failed_when: false
 
+    # A negative test: the wrong password must be refused by password
+    # authentication itself, not by some unrelated failure.
     - name: Require a wrong password to be refused by password authentication
-      ansible.builtin.assert:
-        that:
-          - wrong_login.rc != 0
-          - "'password authentication failed' in wrong_login.stderr"
-        success_msg: A wrong password is refused by password authentication.
-        fail_msg: >-
-          Expected a wrong password to fail with "password authentication failed",
-          got rc={{ wrong_login.rc }}:
-          {{ (wrong_login.stderr | trim) or (wrong_login.stdout | trim) }}
+      incidentsim.verify.check:
+        id: db.wrong-password-refused
+        description: A wrong password is refused by password authentication
+        passed: "{{ (wrong_login | incidentsim.verify.dig('rc', 0)) != 0 and 'password authentication failed' in (wrong_login | incidentsim.verify.dig('stderr', '')) }}"
+        error: "{{ wrong_login | incidentsim.verify.technical_error }}"
+        observed: "rc={{ wrong_login | incidentsim.verify.dig('rc', '?') }}"
+        expected: "rc != 0 with \"password authentication failed\""
+        evidence: "{{ (wrong_login | incidentsim.verify.dig('stderr', '') | trim) or (wrong_login | incidentsim.verify.dig('stdout', '') | trim) }}"
 
     - name: Save a test order through the application
       ansible.builtin.uri:
@@ -88,12 +89,14 @@
       failed_when: false
 
     - name: Require the order to be accepted
-      ansible.builtin.assert:
-        that:
-          - probe_write.status == 201
-        fail_msg: >-
-          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
-          {{ probe_write.content | default(probe_write.msg) | default('') }}
+      incidentsim.verify.check:
+        id: app.write-accepted
+        description: The application accepts a new order
+        passed: "{{ (probe_write | incidentsim.verify.dig('status')) == 201 and (probe_write | incidentsim.verify.dig('json.id')) is not none }}"
+        error: "{{ probe_write | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ probe_write | incidentsim.verify.dig('status', 'no response') }}"
+        expected: HTTP 201 from POST /orders
+        evidence: "{{ probe_write | incidentsim.verify.dig('msg', '') }}"
 
     - name: Read the test order back
       ansible.builtin.uri:
@@ -105,11 +108,10 @@
       failed_when: false
 
     - name: Require the stored order to match
-      ansible.builtin.assert:
-        that:
-          - probe_read.status == 200
-          - probe_read.json.item == "verification"
-        success_msg: The application stores and reads orders.
-        fail_msg: >-
-          Expected order {{ probe_write.json.id }} to be read back, got HTTP
-          {{ probe_read.status }}.
+      incidentsim.verify.check:
+        id: app.read-back
+        description: The stored order is read back unchanged
+        passed: "{{ (probe_read | incidentsim.verify.dig('status')) == 200 and (probe_read | incidentsim.verify.dig('json.item')) == 'verification' }}"
+        error: "{{ probe_read | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ probe_read | incidentsim.verify.dig('status', 'no response') }}"
+        expected: "HTTP 200 for order {{ probe_write.json.id }} with item verification"

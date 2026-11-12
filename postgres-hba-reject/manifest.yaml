@@ -1,0 +1,19 @@
+schema_version: 1
+id: postgres-hba-reject
+description: The orders application cannot authenticate to PostgreSQL and its health endpoint reports failure.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 3m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - db.correct-password-accepted
+      - db.wrong-password-refused
+      - app.write-accepted
+      - app.read-back

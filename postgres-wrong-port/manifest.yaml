@@ -1,0 +1,19 @@
+schema_version: 1
+id: postgres-wrong-port
+description: The orders application cannot reach PostgreSQL on the address and port it is configured to use.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 3m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - db.tcp-ready
+      - db.correct-password-accepted
+      - app.write-accepted
+      - app.read-back

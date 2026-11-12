@@ -1,0 +1,17 @@
+schema_version: 1
+id: postgres-lock
+description: Order writes through the application stall behind a database lock.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 6m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - app.health
+      - writes.all-within-budget

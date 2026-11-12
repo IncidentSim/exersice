@@ -1,0 +1,20 @@
+schema_version: 1
+id: postgres-bad-config
+description: A PostgreSQL tuning release leaves the database with settings that do not fit the VM.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 3m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - db.accepts-connections
+      - settings.tuning-retained
+      - settings.shared-buffers-fit
+      - app.write-accepted
+      - app.read-back

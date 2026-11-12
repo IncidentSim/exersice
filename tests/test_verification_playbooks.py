@@ -102,6 +102,47 @@ def test_conn_leak_unreadable_session_counts_never_pass(tmp_path, app, db):
     assert data["status"] == "error", data
 
 
+# ---------------------------------------------------------------- postgres-lock
+def test_lock_pass_and_slow_writes_fail(tmp_path, app):
+    vars_ = {"app_url": app.url, "sample_count": 3, "sample_interval": 0}
+    proc, data = run_playbook(tmp_path, playbook("postgres-lock"), vars_)
+    assert proc.returncode == 0 and data["status"] == "pass", proc.stdout
+    app.mode["write_latency"] = 2  # a write waiting on a lock exceeds the 1 s budget
+    (tmp_path / "slow").mkdir()
+    proc, data = run_playbook(tmp_path / "slow", playbook("postgres-lock"), vars_)
+    failing = [c for c in data["checks"] if c["status"] == "fail"]
+    assert data["status"] == "fail" and failing[0]["id"].startswith("writes.saved.")
+    assert failing[0]["expected"] == "HTTP 201 within 1 s"
+
+
+# ---------------------------------------------------------------- postgres-missing-index
+def test_missing_index_fast_correct_reports_pass(tmp_path, app, db):
+    db.set(sales=3)
+    proc, data = run_playbook(tmp_path, playbook("postgres-missing-index"), {"app_url": app.url}, db=db)
+    assert proc.returncode == 0 and data["status"] == "pass", proc.stdout
+    assert set(by_id(data)) == {"reports.http-ok", "reports.counts-correct", "reports.latency-within-budget"}
+
+
+def test_missing_index_slow_reports_fail_on_latency_only(tmp_path, app, db):
+    app.mode["latency"] = 0.4
+    proc, data = run_playbook(tmp_path, playbook("postgres-missing-index"), {"app_url": app.url}, db=db)
+    ids = by_id(data)
+    assert ids["reports.http-ok"]["status"] == "pass" and ids["reports.counts-correct"]["status"] == "pass"
+    assert ids["reports.latency-within-budget"]["status"] == "fail" and data["status"] == "fail"
+
+
+def test_missing_index_wrong_sql_correctness_fails(tmp_path, app, db):
+    db.set(sales=4)  # the application says 3
+    proc, data = run_playbook(tmp_path, playbook("postgres-missing-index"), {"app_url": app.url}, db=db)
+    assert by_id(data)["reports.counts-correct"]["status"] == "fail"
+
+
+def test_missing_index_database_tooling_missing_is_error(tmp_path, app, db):
+    db.set(mode="broken")
+    proc, data = run_playbook(tmp_path, playbook("postgres-missing-index"), {"app_url": app.url}, db=db)
+    assert data["status"] == "error"
+
+
 # ---------------------------------------------------------------- all scenarios
 def test_all_eight_scenarios_have_manifests():
     assert SCENARIOS == ["nginx-wrong-api", "postgres-bad-config", "postgres-conn-leak", "postgres-disk-full",

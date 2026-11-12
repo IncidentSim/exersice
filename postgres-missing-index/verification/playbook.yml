@@ -57,22 +57,44 @@
       register: expected_counts
       changed_when: false
 
-    - name: Require each report to be correct and fast
-      ansible.builtin.assert:
-        that:
-          - item.0.rc == 0
-          - item.0.stdout_lines[-1].split()[0] == "200"
-          - (item.0.stdout_lines[:-1] | join('\n') | from_json).orders | int == item.1.stdout | trim | int
-          - item.0.stdout_lines[-1].split()[1] | float <= max_report_seconds
-        success_msg: >-
-          Customer {{ item.0.item }}: {{ item.1.stdout | trim }} sales in
-          {{ item.0.stdout_lines[-1].split()[1] }} s.
-        fail_msg: >-
-          Customer {{ item.0.item }}: expected HTTP 200 with {{ item.1.stdout | trim }}
-          sales within {{ max_report_seconds }} s, got
-          {{ item.0.stdout_lines[-1] | default('no response') }}
-          {{ item.0.stderr | default('') }}
-          {{ (item.0.stdout_lines[:-1] | join(' '))[:200] }}
+    - name: Collect one row per customer
+      ansible.builtin.set_fact:
+        report_rows: >-
+          {{ report_rows | default([]) + [{
+               'customer': item.0.item,
+               'rc': item.0.rc | default(-1),
+               'http': (item.0.stdout_lines[-1].split()[0] if (item.0.stdout_lines | default([]) | length) > 0 else ''),
+               'seconds': (item.0.stdout_lines[-1].split()[1] | float if (item.0.stdout_lines | default([]) | length) > 0 and (item.0.stdout_lines[-1].split() | length) > 1 else none),
+               'orders': ((item.0.stdout_lines[:-1] | join('\n') | from_json).orders | int
+                          if ((item.0.stdout_lines[:-1] | join('\n')) is match('^\s*\{')) else none),
+               'expected': item.1.stdout | trim | int
+             }] }}
       loop: "{{ reports.results | zip(expected_counts.results) | list }}"
       loop_control:
         label: "{{ item.0.item }}"
+
+    - name: Require every report request to succeed
+      incidentsim.verify.check:
+        id: reports.http-ok
+        description: Every customer report request returns HTTP 200
+        passed: "{{ report_rows | rejectattr('http', 'equalto', '200') | list | length == 0 and report_rows | rejectattr('rc', 'equalto', 0) | list | length == 0 }}"
+        error: "{{ reports.results | map('incidentsim.verify.technical_error') | select | first | default('') }}"
+        observed: "{{ report_rows | map(attribute='customer') | zip(report_rows | map(attribute='http')) | map('join', ': HTTP ') | join('; ') }}"
+        expected: HTTP 200 for every customer
+
+    - name: Require every report to match the database
+      incidentsim.verify.check:
+        id: reports.counts-correct
+        description: The reported number of sales matches PostgreSQL for each customer
+        # A missing or unparsable count is none and never equals a number.
+        passed: "{{ (report_rows | map(attribute='orders') | list) == (report_rows | map(attribute='expected') | list) }}"
+        observed: "{{ report_rows | map(attribute='customer') | zip(report_rows | map(attribute='orders')) | map('join', ': ') | join('; ') }}"
+        expected: "{{ report_rows | map(attribute='customer') | zip(report_rows | map(attribute='expected')) | map('join', ': ') | join('; ') }}"
+
+    - name: Require every report to be fast
+      incidentsim.verify.check:
+        id: reports.latency-within-budget
+        description: Every report is served within the latency budget
+        passed: "{{ report_rows | rejectattr('seconds', 'equalto', none) | list | length == report_rows | length and (report_rows | map(attribute='seconds') | max) <= max_report_seconds }}"
+        observed: "{{ report_rows | map(attribute='customer') | zip(report_rows | map(attribute='seconds')) | map('join', ': ') | join(' s; ') }} s"
+        expected: "each report <= {{ max_report_seconds }} s"

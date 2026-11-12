@@ -1,0 +1,19 @@
+schema_version: 1
+id: postgres-disk-full
+description: New orders stop being saved although the root filesystem has plenty of space and backups must keep running.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 6m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - db.accepts-connections
+      - window.writes-served
+      - backups.running
+      - storage.free-space-stable

@@ -38,13 +38,14 @@
       failed_when: false
 
     - name: Require PostgreSQL to accept connections
-      ansible.builtin.assert:
-        that:
-          - data_directory_query.rc == 0
-          - data_directory_query.stdout | trim | length > 0
-        fail_msg: >-
-          PostgreSQL does not accept local connections:
-          {{ data_directory_query.stderr | default('') | trim }}
+      incidentsim.verify.check:
+        id: db.accepts-connections
+        description: PostgreSQL accepts local connections
+        passed: "{{ (data_directory_query | incidentsim.verify.dig('rc')) == 0 and (data_directory_query | incidentsim.verify.dig('stdout', '') | trim | length) > 0 }}"
+        error: "{{ data_directory_query | incidentsim.verify.technical_error }}"
+        observed: "rc={{ data_directory_query | incidentsim.verify.dig('rc', '?') }}"
+        expected: rc=0 and a data directory
+        evidence: "{{ data_directory_query | incidentsim.verify.dig('stderr', '') | trim }}"
 
     - name: Start the observation window
       ansible.builtin.set_fact:
@@ -58,9 +59,17 @@
       loop_control:
         loop_var: sample_index
 
-    - name: Summarize the observation window
+    # Reached only when every write of the window was accepted and read back.
+    - name: Record that every write was served
+      incidentsim.verify.check:
+        id: window.writes-served
+        description: Every order in the observation window was accepted and read back
+        passed: true
+        observed: "{{ sample_count }} of {{ sample_count }} writes served"
+        expected: "{{ sample_count }} of {{ sample_count }} writes served"
+
+    - name: Summarize successful backup runs in the window
       ansible.builtin.set_fact:
-        free_decline_mib: "{{ free_samples[0] - (free_samples | min) }}"
         successful_backup_runs: >-
           {{ backup_samples
              | rejectattr('exit_ts', 'equalto', backup_samples[0].exit_ts)
@@ -70,26 +79,39 @@
              | list
              | length }}
 
+    # Backups must keep running: disabling or slowing them is not a fix.
     - name: Require backups to keep running
-      ansible.builtin.assert:
-        that:
-          - successful_backup_runs | int >= min_backup_runs
-        success_msg: "{{ successful_backup_runs }} backups finished successfully during the window."
-        fail_msg: >-
-          Expected at least {{ min_backup_runs }} successful runs of {{ backup_service }}
-          in {{ (sample_count - 1) * sample_interval }} seconds, observed
-          {{ successful_backup_runs }}. Backups must not be disabled or slowed down.
+      incidentsim.verify.check:
+        id: backups.running
+        description: Backups keep finishing successfully during the window
+        passed: "{{ successful_backup_runs | int >= min_backup_runs }}"
+        observed: "{{ successful_backup_runs }} successful runs of {{ backup_service }} in {{ (sample_count - 1) * sample_interval }} s"
+        expected: "at least {{ min_backup_runs }} successful runs"
+
+    - name: Measure the lowest free space in the window
+      incidentsim.verify.metrics:
+        samples: "{{ free_samples }}"
+        name: free_mib
+        window_seconds: "{{ (sample_count - 1) * sample_interval }}"
+        min_samples: "{{ sample_count }}"
+        min_coverage: 0.9
+        aggregate: min
+      register: free_lowest
+
+    - name: Read the first free space sample
+      incidentsim.verify.metrics:
+        samples: "{{ free_samples }}"
+        name: free_mib
+        window_seconds: "{{ (sample_count - 1) * sample_interval }}"
+        min_samples: "{{ sample_count }}"
+        min_coverage: 0.9
+        aggregate: first
+      register: free_first
 
     - name: Require stable free space on the PostgreSQL data filesystem
-      ansible.builtin.assert:
-        that:
-          - free_samples | min >= min_free_mib
-          - free_decline_mib | int <= max_free_decline_mib
-        success_msg: >-
-          Free space on the data filesystem stayed between {{ free_samples | min }}
-          and {{ free_samples | max }} MiB.
-        fail_msg: >-
-          Expected at least {{ min_free_mib }} MiB free and a decline of at most
-          {{ max_free_decline_mib }} MiB on the filesystem of {{ data_directory }}.
-          Observed free space (MiB): {{ free_samples | join(', ') }};
-          decline {{ free_decline_mib }} MiB.
+      incidentsim.verify.check:
+        id: storage.free-space-stable
+        description: The data filesystem keeps free space and does not keep shrinking
+        passed: "{{ free_lowest.value >= min_free_mib and (free_first.value - free_lowest.value) <= max_free_decline_mib }}"
+        observed: "free MiB: {{ free_samples | map(attribute='value') | join(', ') }}; decline {{ free_first.value - free_lowest.value }} MiB"
+        expected: "at least {{ min_free_mib }} MiB free and a decline of at most {{ max_free_decline_mib }} MiB on the filesystem of {{ data_directory }}"

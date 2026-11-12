@@ -1,0 +1,18 @@
+schema_version: 1
+id: postgres-missing-index
+description: Per-customer sales reports have become slow although the data is correct.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 4m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - reports.http-ok
+      - reports.counts-correct
+      - reports.latency-within-budget

@@ -7,6 +7,8 @@ Use the project-local `$create-incident-exercise` skill when creating or substan
 ## Required contract
 
 - Keep the entry points declared in `vm.json`: `infra`, `incident`, and `verification`.
+- Provide `manifest.yaml` (see `docs/adr/0001-ansible-verification-contract.md`) that agrees with `vm.json`: `id`, `description`, `environment`, `actions.provision`/`inject`, `verification.{playbook,timeout,report.checks}`.
+- Express verification results with `incidentsim.verify.check` (`pass`/`fail`/`error` plus `observed`/`expected`) from `collections/ansible_collections/incidentsim/verify`; list in `report.checks` every check that must be present on success. Never use `ignore_errors` or play-wide `failed_when: false` in verification; classify observation faults with `incidentsim.verify.technical_error` so a broken verifier is an `error`, not a `fail`.
 - Put application sources and their build files under `apps/`; do not hide application source in an Ansible template.
 - Make the infra playbook idempotently produce the healthy baseline and restore it after the incident.
 - Make the incident playbook idempotently introduce only the intended fault. It must fail clearly when its prerequisite infrastructure is absent.
@@ -27,7 +29,7 @@ Use the project-local `$create-incident-exercise` skill when creating or substan
 
 ## Definition of done
 
-Validate JSON, run `ansible-playbook --syntax-check` for all three entry points, and exercise the full lifecycle against a disposable VM:
+Validate JSON, run `ansible-playbook --syntax-check` for all three entry points, run `pytest collections tests` (fixture-based, no VM), and exercise the full lifecycle against a disposable VM:
 
 ```text
 infra -> verify PASS -> incident -> verify FAIL -> infra -> verify PASS

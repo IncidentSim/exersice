@@ -21,13 +21,13 @@
       failed_when: false
 
     - name: Require PostgreSQL to accept TCP connections on 127.0.0.1:5432
-      ansible.builtin.assert:
-        that:
-          - tcp_ready.rc == 0
-        success_msg: PostgreSQL accepts TCP connections on 127.0.0.1:5432.
-        fail_msg: >-
-          Expected PostgreSQL to accept TCP connections on 127.0.0.1:5432,
-          pg_isready reported: {{ tcp_ready.stdout | trim }} (rc={{ tcp_ready.rc }})
+      incidentsim.verify.check:
+        id: db.tcp-ready
+        description: PostgreSQL accepts TCP connections on 127.0.0.1:5432
+        passed: "{{ (tcp_ready | incidentsim.verify.dig('rc')) == 0 }}"
+        error: "{{ tcp_ready | incidentsim.verify.technical_error }}"
+        observed: "{{ tcp_ready | incidentsim.verify.dig('stdout', '') | trim }} (rc={{ tcp_ready | incidentsim.verify.dig('rc', '?') }})"
+        expected: accepting connections (rc=0) on 127.0.0.1:5432
 
     - name: Read the application password
       ansible.builtin.slurp:
@@ -57,14 +57,14 @@
       failed_when: false
 
     - name: Require the correct password to be accepted
-      ansible.builtin.assert:
-        that:
-          - correct_login.rc == 0
-          - correct_login.stdout | trim == app_user
-        success_msg: "{{ app_user }} logs in over TCP with its password."
-        fail_msg: >-
-          Expected {{ app_user }} to log in to {{ app_database }} at 127.0.0.1:5432,
-          got rc={{ correct_login.rc }}: {{ correct_login.stderr | trim }}
+      incidentsim.verify.check:
+        id: db.correct-password-accepted
+        description: The application role logs in over TCP with its password
+        passed: "{{ (correct_login | incidentsim.verify.dig('rc')) == 0 and (correct_login | incidentsim.verify.dig('stdout', '') | trim) == app_user }}"
+        error: "{{ correct_login | incidentsim.verify.technical_error }}"
+        observed: "rc={{ correct_login | incidentsim.verify.dig('rc', '?') }}"
+        expected: "{{ app_user }} logs in to {{ app_database }} at 127.0.0.1:5432 (rc=0)"
+        evidence: "{{ correct_login | incidentsim.verify.dig('stderr', '') | trim }}"
 
     - name: Save a test order through the application
       ansible.builtin.uri:
@@ -81,12 +81,14 @@
       failed_when: false
 
     - name: Require the order to be accepted
-      ansible.builtin.assert:
-        that:
-          - probe_write.status == 201
-        fail_msg: >-
-          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
-          {{ probe_write.content | default(probe_write.msg) | default('') }}
+      incidentsim.verify.check:
+        id: app.write-accepted
+        description: The application accepts a new order
+        passed: "{{ (probe_write | incidentsim.verify.dig('status')) == 201 and (probe_write | incidentsim.verify.dig('json.id')) is not none }}"
+        error: "{{ probe_write | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ probe_write | incidentsim.verify.dig('status', 'no response') }}"
+        expected: HTTP 201 from POST /orders
+        evidence: "{{ probe_write | incidentsim.verify.dig('msg', '') }}"
 
     - name: Read the test order back
       ansible.builtin.uri:
@@ -98,11 +100,10 @@
       failed_when: false
 
     - name: Require the stored order to match
-      ansible.builtin.assert:
-        that:
-          - probe_read.status == 200
-          - probe_read.json.item == "verification"
-        success_msg: The application stores and reads orders.
-        fail_msg: >-
-          Expected order {{ probe_write.json.id }} to be read back, got HTTP
-          {{ probe_read.status }}.
+      incidentsim.verify.check:
+        id: app.read-back
+        description: The stored order is read back unchanged
+        passed: "{{ (probe_read | incidentsim.verify.dig('status')) == 200 and (probe_read | incidentsim.verify.dig('json.item')) == 'verification' }}"
+        error: "{{ probe_read | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ probe_read | incidentsim.verify.dig('status', 'no response') }}"
+        expected: "HTTP 200 for order {{ probe_write.json.id }} with item verification"
