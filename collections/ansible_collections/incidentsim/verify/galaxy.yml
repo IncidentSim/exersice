@@ -1,0 +1,12 @@
+namespace: incidentsim
+name: verify
+version: 1.0.0
+readme: README.md
+authors:
+  - IncidentSim
+description: Structured verification checks, observation helpers and report callback for IncidentSim exercises
+license:
+  - MIT
+tags:
+  - verification
+dependencies: {}
