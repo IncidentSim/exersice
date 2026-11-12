@@ -23,17 +23,19 @@
   failed_when: false
 
 - name: Require the application to serve requests
-  ansible.builtin.assert:
-    that:
-      - probe_health.status == 200
-      - probe_read.status == 200
-      - probe_read.json.item == "verification"
-    success_msg: "Sample {{ sample_index }}: application requests succeeded."
-    fail_msg: >-
-      Sample {{ sample_index }}: expected HTTP 200 from /healthz and
-      /orders/{{ probe_order_id }}, got {{ probe_health.status }} and
-      {{ probe_read.status }}:
-      {{ probe_health.content | default(probe_health.msg) | default('') }}
+  incidentsim.verify.check:
+    id: "window.served.{{ '%02d' | format(sample_index | int) }}"
+    description: "Sample {{ sample_index }}: /healthz and the test order are served"
+    passed: >-
+      {{ (probe_health | incidentsim.verify.dig('status')) == 200
+         and (probe_read | incidentsim.verify.dig('status')) == 200
+         and (probe_read | incidentsim.verify.dig('json.item')) == 'verification' }}
+    error: "{{ (probe_health | incidentsim.verify.technical_error) or (probe_read | incidentsim.verify.technical_error) }}"
+    observed: >-
+      /healthz {{ probe_health | incidentsim.verify.dig('status', 'no response') }},
+      /orders/{{ probe_order_id }} {{ probe_read | incidentsim.verify.dig('status', 'no response') }}
+    expected: HTTP 200 from /healthz and /orders/{{ probe_order_id }} (item verification)
+    evidence: "{{ probe_health | incidentsim.verify.dig('msg', '') }}"
 
 - name: Count client sessions in PostgreSQL
   ansible.builtin.command:
@@ -54,6 +56,14 @@
   register: session_count
   changed_when: false
 
+# A non-numeric answer is recorded as an invalid sample (null), which the
+# metrics module drops and reports instead of silently counting it as zero.
 - name: Record the sample
   ansible.builtin.set_fact:
-    session_samples: "{{ session_samples + [session_count.stdout | trim | int] }}"
+    session_samples: >-
+      {{ session_samples + [{
+           'ts': (sample_index | int) * (sample_interval | int),
+           'name': 'client_sessions',
+           'labels': {},
+           'value': (session_count.stdout | trim | int) if (session_count.stdout | trim) is match('^[0-9]+$') else none
+         }] }}

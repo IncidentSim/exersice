@@ -1,0 +1,17 @@
+schema_version: 1
+id: nginx-wrong-api
+description: Nginx in front of an echo application does not preserve the client's Host header.
+environment: vm.json
+actions:
+  provision:
+    playbook: infra/playbook.yml
+  inject:
+    playbook: incident/playbook.yml
+verification:
+  playbook: verification/playbook.yml
+  timeout: 2m
+  report:
+    schema: incidentsim.verify/v1
+    checks:
+      - app.reachable
+      - host.header-preserved

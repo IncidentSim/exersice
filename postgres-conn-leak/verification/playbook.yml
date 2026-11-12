@@ -36,21 +36,22 @@
       failed_when: false
 
     - name: Require PostgreSQL to accept connections
-      ansible.builtin.assert:
-        that:
-          - max_connections_query.rc == 0
-        fail_msg: >-
-          PostgreSQL does not accept local connections:
-          {{ max_connections_query.stderr | default('') | trim }}
+      incidentsim.verify.check:
+        id: db.accepts-connections
+        description: PostgreSQL accepts local connections
+        passed: "{{ (max_connections_query | incidentsim.verify.dig('rc')) == 0 }}"
+        error: "{{ max_connections_query | incidentsim.verify.technical_error }}"
+        observed: "rc={{ max_connections_query | incidentsim.verify.dig('rc', '?') }}"
+        expected: rc=0
+        evidence: "{{ max_connections_query | incidentsim.verify.dig('stderr', '') | trim }}"
 
     - name: Require a bounded connection limit
-      ansible.builtin.assert:
-        that:
-          - max_connections_query.stdout | trim | int <= max_connections_ceiling
-        success_msg: "max_connections = {{ max_connections_query.stdout | trim }}"
-        fail_msg: >-
-          Expected max_connections <= {{ max_connections_ceiling }}, found
-          {{ max_connections_query.stdout | trim }}. A larger limit only delays exhaustion.
+      incidentsim.verify.check:
+        id: db.max-connections-bounded
+        description: max_connections is not raised to hide the leak
+        passed: "{{ (max_connections_query.stdout | trim) is match('^[0-9]+$') and (max_connections_query.stdout | trim | int) <= max_connections_ceiling }}"
+        observed: "max_connections = {{ max_connections_query.stdout | trim }}"
+        expected: "max_connections <= {{ max_connections_ceiling }} (a larger limit only delays exhaustion)"
 
     - name: Save a test order through the application
       ansible.builtin.uri:
@@ -67,12 +68,14 @@
       failed_when: false
 
     - name: Require the order to be accepted
-      ansible.builtin.assert:
-        that:
-          - probe_write.status == 201
-        fail_msg: >-
-          Expected HTTP 201 from POST /orders, got {{ probe_write.status }}:
-          {{ probe_write.content | default(probe_write.msg) | default('') }}
+      incidentsim.verify.check:
+        id: app.write-accepted
+        description: The application accepts a new order
+        passed: "{{ (probe_write | incidentsim.verify.dig('status')) == 201 and (probe_write | incidentsim.verify.dig('json.id')) is not none }}"
+        error: "{{ probe_write | incidentsim.verify.technical_error }}"
+        observed: "HTTP {{ probe_write | incidentsim.verify.dig('status', 'no response') }}"
+        expected: HTTP 201 from POST /orders
+        evidence: "{{ probe_write | incidentsim.verify.dig('msg', '') }}"
 
     - name: Start the observation window
       ansible.builtin.set_fact:
@@ -85,18 +88,32 @@
       loop_control:
         loop_var: sample_index
 
-    - name: Summarize the second half of the window
-      ansible.builtin.set_fact:
-        settled_samples: "{{ session_samples[(sample_count // 2):] }}"
+    # Reached only when every sample passed its own check.
+    - name: Record that every sample was served
+      incidentsim.verify.check:
+        id: window.requests-served
+        description: Every request in the observation window was served
+        passed: true
+        observed: "{{ sample_count }} samples served"
+        expected: "{{ sample_count }} samples served"
+
+    # Window = whole observation; warm-up = first half, so only the settled
+    # second half counts (as before). Missing or NaN samples make this an error.
+    - name: Measure the spread of client sessions in the second half of the window
+      incidentsim.verify.metrics:
+        samples: "{{ session_samples }}"
+        name: client_sessions
+        window_seconds: "{{ (sample_count - 1) * sample_interval }}"
+        warmup_seconds: "{{ ((sample_count // 2) * sample_interval) }}"
+        min_samples: "{{ sample_count - (sample_count // 2) }}"
+        min_coverage: 0.9
+        aggregate: spread
+      register: session_spread
 
     - name: Require a stable number of client sessions
-      ansible.builtin.assert:
-        that:
-          - (settled_samples | max) - (settled_samples | min) <= max_session_drift
-        success_msg: >-
-          Client sessions stayed between {{ settled_samples | min }} and
-          {{ settled_samples | max }} during the second half of the window.
-        fail_msg: >-
-          Expected the number of client sessions to change by at most
-          {{ max_session_drift }} during the second half of the window.
-          Observed sessions: {{ session_samples | join(', ') }}.
+      incidentsim.verify.check:
+        id: sessions.stable
+        description: Client sessions are stable during the second half of the window
+        passed: "{{ session_spread.value <= max_session_drift }}"
+        observed: "spread {{ session_spread.value }} over {{ session_spread.used }} samples; sessions {{ session_samples | map(attribute='value') | join(', ') }}"
+        expected: "spread <= {{ max_session_drift }}"
