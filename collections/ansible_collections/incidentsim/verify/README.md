@@ -11,6 +11,15 @@ Machinery for exercise verification playbooks. Playbooks compose observations
 | filters `dig`, `technical_error`, `prometheus_samples` | Safe lookups, classification of verifier faults vs. application symptoms, Prometheus text parsing. |
 | callback `incidentsim.verify.report` | Records every check and every other task failure as an `error` check and writes the report atomically. |
 
+Strictness: series identity is a canonical JSON of the label set (no delimiter
+collisions); malformed Prometheus lines or label sets, non-finite window, warm-up,
+`end`, coverage, counts or timestamps are rejected; an aggregate that is not finite
+(overflow) is `unavailable`; NaN/Inf/boolean samples never contribute. `logs` treats
+non-blank lines without a timestamp as a risk of hidden errors: `expect: absent`
+(and an unmatched `present`) is `unavailable` unless `allow_unparsed: true`.
+Tasks with `no_log` contribute only a check's id and verdict to the report, never
+details. Tasks that carry credentials (`PGPASSWORD`) must set `no_log: true`.
+
 The runner enables the callback and provides `INCIDENTSIM_SCENARIO`,
 `INCIDENTSIM_ATTEMPT_ID` and `INCIDENTSIM_REPORT_PATH`:
 

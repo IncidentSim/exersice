@@ -84,28 +84,82 @@ def app():
     httpd.shutdown()
 
 
+# FIXTURE, NOT SERVICE BEHAVIOUR. One fake executable installed under the names
+# runuser, psql, pg_isready, systemctl and df. It answers from a JSON state file
+# and never touches a database, systemd or the filesystem. What PostgreSQL,
+# pg_hba.conf, systemd or df really print is NOT proven by tests using it; only
+# the verification playbooks' decisions on such answers are.
 SHIM = r'''#!%(python)s
 import json, os, sys
-state = json.load(open(os.environ["FAKE_DB_STATE"]))
-mode = state.get("mode", "ok")
+tool = os.path.basename(sys.argv[0])
 argv = sys.argv[1:]
+state_path = os.environ["FAKE_DB_STATE"]
+state = json.load(open(state_path))
+
+
+def nth(key):
+    counter = "%%s.%%s" %% (state_path, key)
+    n = int(open(counter).read()) if os.path.exists(counter) else 0
+    open(counter, "w").write(str(n + 1))
+    return n
+
+
+def seq(key, default):
+    values = state.get(key, default)
+    return values[min(nth(key), len(values) - 1)]
+
+
+def die(code, message):
+    sys.stderr.write(message + "\n")
+    sys.exit(code)
+
+
+if state.get("mode") == "broken" or state.get("missing") == tool:
+    die(127, "%%s: No such file or directory" %% tool)
 sql = argv[-1] if argv else ""
-if mode == "broken":
-    sys.stderr.write("runuser: failed to execute psql: No such file or directory\n"); sys.exit(127)
+
+if tool == "pg_isready":
+    if state.get("ready", True):
+        print("127.0.0.1:5432 - accepting connections"); sys.exit(0)
+    print("127.0.0.1:5432 - no response"); sys.exit(2)
+
+if tool == "systemctl":
+    exit_ts, status = seq("backup", [[100, "0"]])
+    print("ExecMainStatus=%%s" %% status)
+    print("ExecMainExitTimestampMonotonic=%%s" %% exit_ts)
+    sys.exit(0)
+
+if tool == "df":
+    print("Avail")
+    print("%%d" %% seq("free", [500]))
+    sys.exit(0)
+
+if tool == "psql":  # direct TCP login: the answer depends on PGPASSWORD
+    user = [a.split("=", 1)[1] for a in argv if a.startswith("--username=")][0]
+    login, given, expected = state.get("login", "ok"), os.environ.get("PGPASSWORD"), state.get("password")
+    refused = 'psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  password authentication failed for user "%%s"' %% user
+    if login == "reject_all":
+        die(2, 'psql: error: FATAL:  no pg_hba.conf entry for host "127.0.0.1", user "%%s", database "incidentsim"' %% user)
+    if login == "unrelated":
+        die(2, "psql: error: connection to server at 127.0.0.1 failed: Connection refused")
+    if login == "trust_all" or given == expected:
+        print(user); sys.exit(0)
+    if login == "wrong_unrelated":
+        die(2, "psql: error: server closed the connection unexpectedly")
+    die(2, refused)
+
+# runuser -u postgres -- psql ... --command <SQL>
 if "SHOW max_connections" in sql:
     print(state.get("max_connections", 100)); sys.exit(0)
 if "pg_stat_activity" in sql:
-    counter = os.environ["FAKE_DB_STATE"] + ".n"
-    n = int(open(counter).read()) if os.path.exists(counter) else 0
-    open(counter, "w").write(str(n + 1))
-    seq = state.get("sessions", [5])
-    value = seq[min(n, len(seq) - 1)]
-    print(value); sys.exit(0)
+    print(seq("sessions", [5])); sys.exit(0)
 if "count(*) FROM sales" in sql:
     print(state.get("sales", 3)); sys.exit(0)
 if "SHOW data_directory" in sql:
     print(state.get("data_directory", "/")); sys.exit(0)
-sys.stderr.write("unexpected SQL: %%s\n" %% sql); sys.exit(1)
+if "current_setting('work_mem')" in sql:
+    print(state.get("settings", "16MB|512MB|134217728|128MB")); sys.exit(0)
+die(1, "unexpected SQL: %%s" %% sql)
 '''
 
 
@@ -114,9 +168,10 @@ def db(tmp_path):
     """A runuser shim whose answers are controlled through db.state."""
     bin_dir = tmp_path / "shim-bin"
     bin_dir.mkdir()
-    shim = bin_dir / "runuser"
-    shim.write_text(SHIM % {"python": sys.executable})
-    shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
+    for name in ("runuser", "psql", "pg_isready", "systemctl", "df"):
+        shim = bin_dir / name
+        shim.write_text(SHIM % {"python": sys.executable})
+        shim.chmod(shim.stat().st_mode | stat.S_IEXEC)
 
     class DB:
         path = str(tmp_path / "db.json")
@@ -125,8 +180,8 @@ def db(tmp_path):
         def set(self, **state):
             with open(self.path, "w") as handle:
                 json.dump(state, handle)
-            if os.path.exists(self.path + ".n"):
-                os.unlink(self.path + ".n")
+            for counter in tmp_path.glob("db.json.*"):  # restart every sequence
+                counter.unlink()
 
     handle = DB()
     handle.set()

@@ -40,6 +40,7 @@
       register: correct_login
       changed_when: false
       failed_when: false
+      no_log: true # the task carries the application password in PGPASSWORD
 
     - name: Require the correct password to be accepted
       incidentsim.verify.check:
@@ -61,6 +62,7 @@
       register: wrong_login
       changed_when: false
       failed_when: false
+      no_log: true # PGPASSWORD is set on this task too
 
     # A negative test: the wrong password must be refused by password
     # authentication itself, not by some unrelated failure.

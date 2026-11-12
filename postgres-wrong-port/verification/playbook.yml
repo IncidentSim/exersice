@@ -55,6 +55,7 @@
       register: correct_login
       changed_when: false
       failed_when: false
+      no_log: true # the task carries the application password in PGPASSWORD
 
     - name: Require the correct password to be accepted
       incidentsim.verify.check:
