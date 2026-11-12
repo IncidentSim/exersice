@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from conftest import REPO, needs_ansible, run_playbook
+from exercise_support import REPO, needs_ansible, run_playbook
 
 pytestmark = needs_ansible
 SCENARIOS = sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(REPO, "*", "manifest.yaml")))
