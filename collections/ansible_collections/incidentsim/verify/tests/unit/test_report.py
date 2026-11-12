@@ -80,3 +80,21 @@ def test_dig():
     assert report.dig(value, "json.missing.deep", "d") == "d"
     assert report.dig(None, "a", 1) == 1
     assert report.dig(value, "json.items.5") is None
+
+
+def test_overflow_is_an_explicit_incomplete_error_and_keeps_every_failure():
+    checks = [report.make_check("p.%d" % i, "pass") for i in range(report.MAX_CHECKS + 50)]
+    checks.append(report.make_check("late.fail", "fail"))
+    checks.append(report.make_check("late.error", "error"))
+    data = report.build_report("s", "A" * 26, checks)
+    ids = {c["id"]: c["status"] for c in data["checks"]}
+    assert data["status"] == "error" and data["complete"] is False
+    assert len(data["checks"]) <= report.MAX_CHECKS
+    assert ids["late.fail"] == "fail" and ids["late.error"] == "error"
+    assert ids["report.overflow"] == "error"
+
+
+def test_exactly_max_checks_is_not_an_overflow():
+    checks = [report.make_check("p.%d" % i, "pass") for i in range(report.MAX_CHECKS)]
+    data = report.build_report("s", "A" * 26, checks)
+    assert data["status"] == "pass" and data["complete"] is True and len(data["checks"]) == report.MAX_CHECKS

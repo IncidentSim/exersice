@@ -111,7 +111,20 @@ def unique_id(check_id, taken):
 
 
 def build_report(scenario, attempt_id, checks, started_at=None, finished_at=None, complete=True):
-    checks = list(checks)[:MAX_CHECKS]
+    checks = list(checks)
+    if len(checks) > MAX_CHECKS:
+        # Never drop a failure silently: keep every non-pass check, fill the
+        # remaining room with passes and add an explicit error. The report is
+        # marked incomplete, so it can never be accepted as a pass.
+        dropped = len(checks) - (MAX_CHECKS - 1)
+        keep = [c for c in checks if c["status"] != "pass"][: MAX_CHECKS - 1]
+        keep += [c for c in checks if c["status"] == "pass"][: MAX_CHECKS - 1 - len(keep)]
+        keep_ids = {c["id"] for c in keep}
+        checks = [c for c in checks if c["id"] in keep_ids]
+        checks.append(make_check(
+            "report.overflow", "error", description="too many checks for one report",
+            evidence="%d checks were dropped to stay within the limit of %d" % (dropped, MAX_CHECKS)))
+        complete = False
     report = {
         "schema": SCHEMA,
         "scenario": scenario,

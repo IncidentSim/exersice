@@ -90,6 +90,8 @@ class CallbackModule(CallbackBase):
         if not (isinstance(raw_id, str) and report.CHECK_ID.match(raw_id)):
             raw_id = "task." + report.slug(task.get_name())
         evidence = data.get("msg") or data.get("stderr") or "task failed"
+        if task.no_log or data.get("censored"):
+            evidence = "details hidden by no_log"
         if data.get("unreachable"):
             evidence = "unreachable: %s" % evidence
         self._add(report.make_check(raw_id, "error", description="technical failure of task: %s" % task.get_name(),

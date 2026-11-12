@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 
-from conftest import COLLECTIONS
+from collection_support import COLLECTIONS
 
 ANSIBLE = shutil.which("ansible-playbook", path=os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""))
 pytestmark = pytest.mark.skipif(ANSIBLE is None, reason="ansible-playbook is not installed")
@@ -223,3 +223,29 @@ def test_metrics_spread_in_a_playbook(tmp_path, server):
 """
     proc, data = run(tmp_path, server, tasks)
     assert data["status"] == "pass", data
+
+
+def test_no_log_task_failure_never_leaks_into_the_report(tmp_path, server):
+    tasks = """
+    - ansible.builtin.command:
+        argv: [/nonexistent/tool, "--password=hunter2"]
+      environment:
+        PGPASSWORD: hunter2
+      no_log: true
+"""
+    proc, data = run(tmp_path, server, tasks)
+    assert data["status"] == "error"
+    assert "hunter2" not in json.dumps(data)
+    assert "hunter2" not in proc.stdout + proc.stderr
+
+
+def test_no_log_check_result_is_an_error_without_details(tmp_path, server):
+    tasks = """
+    - incidentsim.verify.check:
+        id: secret.check
+        passed: false
+        observed: "token: topsecretvalue"
+      no_log: true
+"""
+    proc, data = run(tmp_path, server, tasks)
+    assert data["status"] == "error" and "topsecretvalue" not in json.dumps(data)
