@@ -28,6 +28,12 @@ options:
   min_entries: {type: int, default: 1, description: Minimum entries that must be in scope.}
   source_available: {type: bool, default: true, description: Set false when reading the source failed.}
   cursor: {type: str, description: Cursor returned by a previous scan.}
+  allow_unparsed:
+    type: bool
+    default: false
+    description:
+      - Non-blank lines without a parsable timestamp can hide errors. By default they make C(expect=absent)
+        (and an unmatched C(expect=present)) unavailable. Set true only for sources with multi-line records.
   fail_on_unavailable: {type: bool, default: true, description: Fail the task when the scan cannot be trusted.}
 author: IncidentSim
 """
@@ -68,6 +74,7 @@ def main():
             min_entries=dict(type="int", default=1),
             source_available=dict(type="bool", default=True),
             cursor=dict(type="str"),
+            allow_unparsed=dict(type="bool", default=False),
             fail_on_unavailable=dict(type="bool", default=True),
         ),
         mutually_exclusive=[("text", "entries")],
@@ -81,7 +88,8 @@ def main():
     try:
         result = observe.scan_logs(
             entries, p["since"], p["until"], p["pattern"], expect=p["expect"], min_entries=p["min_entries"],
-            available=p["source_available"], cursor=p["cursor"], unparsed=unparsed)
+            available=p["source_available"], cursor=p["cursor"], unparsed=unparsed,
+            allow_unparsed=p["allow_unparsed"])
     except (ValueError, KeyError, TypeError) as exc:
         module.fail_json(msg="invalid log scan: %s" % exc)
     except Exception as exc:  # invalid regular expression

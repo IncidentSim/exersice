@@ -239,6 +239,44 @@ def test_no_log_task_failure_never_leaks_into_the_report(tmp_path, server):
     assert "hunter2" not in proc.stdout + proc.stderr
 
 
+# An arbitrary value with no "password="/"token:" style key in front of it: only
+# no_log, not pattern based redaction, can keep it out.
+SENTINEL = "Zq9-sentinel-7f3a-Qx"
+
+
+def test_no_log_sentinel_never_reaches_report_or_output(tmp_path, server):
+    tasks = """
+    - ansible.builtin.command:
+        argv: [sh, -c, "echo %(s)s >&2; echo %(s)s; exit 3"]
+      environment:
+        SOMETHING: %(s)s
+      register: leaky
+      no_log: true
+    - ansible.builtin.command:
+        argv: [sh, -c, "echo %(s)s >&2; exit 3"]
+      no_log: true
+      ignore_errors: true
+    - incidentsim.verify.check:
+        id: sentinel.pass
+        passed: true
+        observed: %(s)s
+        expected: %(s)s
+        evidence: %(s)s
+      no_log: true
+    - incidentsim.verify.check:
+        id: sentinel.fail
+        passed: false
+        observed: %(s)s
+        evidence: %(s)s
+      no_log: true
+""" % {"s": SENTINEL}
+    proc, data = run(tmp_path, server, tasks)
+    blob = json.dumps(data) + proc.stdout + proc.stderr + (tmp_path / "report.json").read_text()
+    assert SENTINEL not in blob
+    assert data["status"] == "error"
+    assert all("observed" not in c and "expected" not in c for c in data["checks"] if c["id"].startswith("sentinel."))
+
+
 def test_no_log_check_result_is_an_error_without_details(tmp_path, server):
     tasks = """
     - incidentsim.verify.check:

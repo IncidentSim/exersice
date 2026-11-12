@@ -61,7 +61,7 @@ def test_multiple_label_sets_are_not_silently_mixed():
     r = observe.aggregate_window(s, 60, labels={"db": "b"}, aggregate="max")
     assert r["value"] == 20
     r = observe.aggregate_window(s, 60, merge=True, aggregate="max")
-    assert r["value"] == 20 and set(r["series"]) == {"db=a", "db=b"}
+    assert r["value"] == 20 and set(r["series"]) == {observe._series_key({"db": "a"}), observe._series_key({"db": "b"})}
 
 
 @pytest.mark.parametrize("window,warm", [(0, 0), (10, 10), (10, -1)])
@@ -118,6 +118,109 @@ def test_cursor_resumes_numerically():
     assert rest["scanned"] == 2
     with pytest.raises(ValueError):
         observe.scan_logs(entries, 0, 1e12, ".", cursor="garbage")
+
+
+def test_label_sets_that_used_to_collide_stay_separate_series():
+    # {a: "x,b=y"} and {a: "x", b: "y"} produced the same delimiter-joined key
+    s = series([1, 2], labels={"a": "x,b=y"}) + series([10, 20], labels={"a": "x", "b": "y"})
+    r = observe.aggregate_window(s, 60)
+    assert not r["available"] and "2 series" in r["reason"]
+    r = observe.aggregate_window(s, 60, merge=True, aggregate="max")
+    assert len(r["series"]) == 2 and sorted(r["series"].values()) == [2, 20]
+    assert observe._series_key({"a": "x,b=y"}) != observe._series_key({"a": "x", "b": "y"})
+    only = observe.aggregate_window(s, 60, labels={"a": "x", "b": "y"}, aggregate="max")
+    assert only["value"] == 20
+
+
+@pytest.mark.parametrize("text", [
+    'm{a="x",b} 1',            # label without value
+    'm{a="x" b="y"} 1',        # missing comma
+    'm{a="x",a="y"} 1',        # duplicate label
+    'm{a="x"junk} 1',          # trailing garbage in the label set
+    'm{="x"} 1',
+    'm{a="unterminated} 1',
+    "not a sample",
+    "m abc",                   # value is not a number
+])
+def test_malformed_prometheus_input_is_rejected_not_collapsed(text):
+    with pytest.raises(ValueError):
+        observe.parse_prometheus(text)
+
+
+def test_wellformed_prometheus_still_parses_after_strictness():
+    samples = observe.parse_prometheus('m{a="1",b="two"} 3\nm{} 4\nm 5\nm{a="1",} 6\n')
+    assert [s["value"] for s in samples] == [3.0, 4.0, 5.0, 6.0]
+    assert samples[0]["labels"] == {"a": "1", "b": "two"}
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"window_seconds": float("nan")}, {"window_seconds": float("inf")}, {"window_seconds": "60"},
+    {"window_seconds": 60, "warmup_seconds": float("nan")}, {"window_seconds": 60, "warmup_seconds": float("inf")},
+    {"window_seconds": 60, "end": float("nan")}, {"window_seconds": 60, "end": float("inf")},
+    {"window_seconds": 60, "min_coverage": float("nan")}, {"window_seconds": 60, "min_coverage": 1.5},
+    {"window_seconds": 60, "min_coverage": -0.1},
+    {"window_seconds": 60, "min_samples": -1}, {"window_seconds": 60, "min_samples": 2.5},
+    {"window_seconds": 60, "min_samples": True}, {"window_seconds": 60, "min_samples": 10 ** 9},
+])
+def test_nonfinite_or_nonsensical_parameters_are_rejected(kwargs):
+    with pytest.raises(ValueError):
+        observe.aggregate_window(series([1, 2, 3]), **kwargs)
+
+
+@pytest.mark.parametrize("bad_ts", [float("nan"), float("inf"), None, "10", True])
+def test_bad_sample_timestamps_are_rejected(bad_ts):
+    s = series([1, 2]) + [{"name": "m", "labels": {}, "value": 3, "ts": bad_ts}]
+    with pytest.raises(ValueError):
+        observe.aggregate_window(s, 60)
+
+
+def test_overflowing_aggregates_are_never_available():
+    s = series([1e308, 1e308, 1e308])
+    for how in ("sum", "avg"):
+        r = observe.aggregate_window(s, 60, aggregate=how)
+        assert not r["available"] and r["value"] is None, how
+    r = observe.aggregate_window(series([1e308, -1e308]), 60, aggregate="spread")
+    assert not r["available"]
+    assert observe.aggregate_window(series([1e308, 1e308]), 60, aggregate="max")["available"]
+
+
+def test_invalid_samples_cannot_manufacture_a_passing_aggregate():
+    nan = float("nan")
+    # scoped: the only valid sample is the late one outside the post-warm-up scope
+    s = series([5, nan, nan, nan, nan], step=10)
+    r = observe.aggregate_window(s, window_seconds=40, warmup_seconds=20, aggregate="spread", min_samples=1)
+    assert not r["available"] and r["value"] is None
+    # NaN, inf, strings, None and booleans next to one real sample: spread must not become 0 "stable"
+    mixed = series([nan, float("inf"), "x", None, True, 5])
+    r = observe.aggregate_window(mixed, 60, aggregate="spread", min_samples=3)
+    assert not r["available"] and r["invalid"] == 5
+    r = observe.aggregate_window(mixed, 60, aggregate="spread", min_samples=1, min_coverage=0.5)
+    assert not r["available"]  # a single sample covers none of the window
+    # invalid samples are excluded from, not counted in, the aggregate
+    r = observe.aggregate_window(series([1, nan, 3]), 60, aggregate="count")
+    assert r["value"] == 2 and r["invalid"] == 1
+
+
+def test_unparsed_lines_make_absent_unavailable():
+    entries, unparsed = observe.parse_log_text(LOG)
+    assert unparsed == 1
+    r = observe.scan_logs(entries, "2026-11-12T10:00:00Z", "2026-11-12T10:01:00Z", "NEVER", expect="absent", unparsed=unparsed)
+    assert not r["available"] and not r["passed"] and "no parsable timestamp" in r["reason"]
+    # explicit opt-in documents the accepted risk
+    r = observe.scan_logs(entries, "2026-11-12T10:00:00Z", "2026-11-12T10:01:00Z", "NEVER", expect="absent",
+                          unparsed=unparsed, allow_unparsed=True)
+    assert r["available"] and r["passed"]
+    # a found match is trustworthy even with unparsed lines; a missing one is not
+    r = observe.scan_logs(entries, "2026-11-12T10:00:00Z", "2026-11-12T10:01:00Z", "ERROR", unparsed=unparsed)
+    assert r["available"] and r["passed"]
+    r = observe.scan_logs(entries, "2026-11-12T10:00:00Z", "2026-11-12T10:01:00Z", "NEVER", unparsed=unparsed)
+    assert not r["available"]
+
+
+def test_nonfinite_log_times_are_rejected():
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            observe.parse_time(bad)
 
 
 def test_bad_scope_rejected():

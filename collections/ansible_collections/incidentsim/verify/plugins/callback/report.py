@@ -71,13 +71,20 @@ class CallbackModule(CallbackBase):
         try:
             self._record_unsafe(result, ignore_errors, failed)
         except Exception as exc:  # pylint: disable=broad-except
+            detail = type(exc).__name__
+            if not getattr(result._task, "no_log", False):
+                detail = "%s: %s" % (detail, exc)
             self._add(report.make_check("callback.internal", "error", description="report callback failed",
-                                        evidence="%s: %s" % (type(exc).__name__, exc)))
+                                        evidence=detail))
 
     def _record_unsafe(self, result, ignore_errors=False, failed=False):
         data = result._result
         check = data.get("incidentsim_check")
+        hidden = bool(result._task.no_log or data.get("censored") or data.get("_ansible_no_log"))
         if isinstance(check, dict) and "id" in check:
+            if hidden:
+                # Nothing a no_log task produced may reach the report except its verdict.
+                check = {"id": check["id"], "status": check.get("status", "error")}
             self._add(check)
             return
         if "results" in data and isinstance(data["results"], list):
